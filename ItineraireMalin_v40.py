@@ -206,7 +206,20 @@ def main():
     import requests # Import local pour Streamlit Cloud
     StateManager.init_state()
     
-    st.header("🚚 ItinéraireMalin - Ramonage")
+    st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 3rem;
+            padding-bottom: 0rem;
+        }
+        h1 {
+            line-height: 1.5;
+            padding-bottom: 10px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.title("🚚 ItinéraireMalin - Ramonage")
     
     # Barre latérale : Paramètres de la tournée
     with st.sidebar:
