@@ -12,6 +12,8 @@ import csv
 import io
 import os
 import re
+from streamlit_gsheets import GSheetsConnection
+import pandas as pd
 
 def _h(s: str) -> str:
     """Échappe les caractères HTML dans une chaîne utilisateur."""
@@ -3215,7 +3217,23 @@ class UI:
         # ── Auto-ajout au carnet : détection des adresses absentes ──────────
         today_str = datetime.today().strftime("%d/%m/%Y")
         StateManager.auto_add_to_book(points, result.arrival_times, result.order, today_str)
+        
+# Créez la connexion (à mettre avant la fonction main)
+conn = st.connection("gsheets", type=GSheetsConnection)
 
+def load_from_gsheets():
+    """Charge les contacts depuis Google Sheets"""
+    try:
+        df = conn.read(ttl=0) # ttl=0 pour forcer la lecture fraîche
+        return df.to_dict('records')
+    except:
+        return []
+
+def save_to_gsheets(data):
+    """Sauvegarde les contacts vers Google Sheets"""
+    df = pd.DataFrame(data)
+    conn.update(data=df)
+    st.success("Données synchronisées avec Google Sheets !")
 # ==========================================================
 # MAIN
 # ==========================================================
