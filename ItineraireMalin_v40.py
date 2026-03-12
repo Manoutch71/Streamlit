@@ -12,30 +12,133 @@ import csv
 import io
 import os
 import re
-import requests
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 
-# --- CONFIGURATION DE LA PAGE ---
+# Configuration de la page
 st.set_page_config(page_title="ItinéraireMalin v40", layout="wide", initial_sidebar_state="expanded")
 
 # Initialisation de la connexion Google Sheets
-try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-except Exception as e:
-    st.error("Erreur de connexion Google Sheets. Vérifiez vos Secrets Streamlit.")
+# Note: L'URL doit être configurée dans les Secrets de Streamlit Cloud
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- UTILITAIRES DE NETTOYAGE ---
 def _h(s: str) -> str:
+    """Échappe les caractères HTML dans une chaîne utilisateur."""
     return _html.escape(str(s))
 
+def _sort_key_date(d: str):
+    """Clé de tri robuste pour dates dd/mm/yyyy → (yyyy, mm, dd) en int."""
+    try:
+        parts = d.split("/")
+        if len(parts) == 3:
+            return (int(parts[2]), int(parts[1]), int(parts[0]))
+    except (ValueError, IndexError):
+        pass
+    return (0, 0, 0)
+
 def _norm_addr(s: str) -> str:
+    """Normalisation robuste d'adresse."""
     s = s.strip().lower()
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
     s = re.sub(r"[-_]", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s
+
+# --- GESTIONNAIRE DE DONNÉES GOOGLE SHEETS ---
+
+class AddressBookManager:
+    """Gère le carnet d'adresses via Google Sheets"""
+    
+    @staticmethod
+    def save_to_file():
+        """Sauvegarde les contacts vers l'onglet 'Contacts'"""
+        try:
+            contacts = st.session_state.get("address_book", [])
+            if contacts:
+                df = pd.DataFrame(contacts)
+                conn.update(worksheet="Contacts", data=df)
+            return True
+        except Exception as e:
+            st.error(f"Erreur sauvegarde GSheets: {e}")
+            return False
+
+    @staticmethod
+    def load_from_file():
+        """Charge les contacts depuis l'onglet 'Contacts'"""
+        try:
+            df = conn.read(worksheet="Contacts", ttl=0)
+            df = df.dropna(how='all')
+            contacts = df.to_dict('records')
+            st.session_state.address_book = contacts
+            StateManager._invalidate_contact_index()
+            return len(contacts)
+        except:
+            return 0
+
+    @staticmethod
+    def import_from_csv(csv_text: str) -> Tuple[int, List[str]]:
+        """Importation depuis CSV (écrase l'existant)"""
+        try:
+            f = io.StringIO(csv_text)
+            reader = csv.DictReader(f)
+            new_contacts = []
+            errors = []
+            required = {"name", "address"}
+            if not required.issubset(set(reader.fieldnames or [])):
+                return 0, [f"Colonnes manquantes (name, address requises)"]
+            
+            for row in reader:
+                if row.get("name") and row.get("address"):
+                    new_contacts.append({
+                        "name": row["name"].strip(),
+                        "address": row["address"].strip(),
+                        "phone": row.get("phone", "").strip(),
+                        "intervention_type": row.get("intervention_type", "Standard_60").strip(),
+                        "visit_date": row.get("visit_date", "").strip(),
+                        "notes": row.get("notes", "").strip()
+                    })
+            
+            if new_contacts:
+                st.session_state.address_book = new_contacts
+                AddressBookManager.save_to_file()
+                return len(new_contacts), errors
+            return 0, ["Fichier vide ou invalide"]
+        except Exception as e:
+            return 0, [str(e)]
+
+    @staticmethod
+    def decode_csv_bytes(b: bytes) -> str:
+        for enc in ['utf-8', 'latin-1', 'cp1252']:
+            try: return b.decode(enc)
+            except: continue
+        return b.decode('utf-8', errors='ignore')
+
+class HistoryManager:
+    """Gère l'historique via Google Sheets"""
+    
+    @staticmethod
+    def save_to_file():
+        try:
+            history = st.session_state.get("client_history", [])
+            if history:
+                df = pd.DataFrame(history)
+                conn.update(worksheet="Historique", data=df)
+        except Exception as e:
+            st.error(f"Erreur sauvegarde historique GSheets: {e}")
+
+    @staticmethod
+    def load_from_file():
+        try:
+            df = conn.read(worksheet="Historique", ttl=0)
+            df = df.dropna(how='all')
+            history = df.to_dict('records')
+            st.session_state.client_history = history
+            return len(history)
+        except:
+            return 0
+
+# --- CLASSES TECHNIQUES (REPRISES DU SCRIPT V40) ---
 
 @dataclass
 class Client:
@@ -51,104 +154,71 @@ class Client:
     notes: str = ""
     duration: int = 60
 
-# --- GESTIONNAIRES DE PERSISTANCE (GOOGLE SHEETS) ---
-class AddressBookManager:
-    @staticmethod
-    def save_to_file():
-        try:
-            contacts = st.session_state.get("address_book", [])
-            if contacts:
-                df = pd.DataFrame(contacts)
-                conn.update(worksheet="Contacts", data=df)
-                return True
-        except Exception as e:
-            st.error(f"Erreur sauvegarde Contacts: {e}")
-        return False
-
-    @staticmethod
-    def load_from_file():
-        try:
-            df = conn.read(worksheet="Contacts", ttl=0)
-            df = df.dropna(how='all')
-            contacts = df.to_dict('records')
-            st.session_state.address_book = contacts
-            return len(contacts)
-        except:
-            st.session_state.address_book = []
-            return 0
-
-class HistoryManager:
-    @staticmethod
-    def save_to_file():
-        try:
-            history = st.session_state.get("client_history", [])
-            if history:
-                df = pd.DataFrame(history)
-                conn.update(worksheet="Historique", data=df)
-        except Exception as e:
-            st.error(f"Erreur sauvegarde Historique: {e}")
-
-    @staticmethod
-    def load_from_file():
-        try:
-            df = conn.read(worksheet="Historique", ttl=0)
-            df = df.dropna(how='all')
-            history = df.to_dict('records')
-            st.session_state.client_history = history
-            return len(history)
-        except:
-            st.session_state.client_history = []
-            return 0
-
 class StateManager:
+    """Gère l'état de l'application et le cache"""
     @staticmethod
     def init_state():
         if "address_book" not in st.session_state:
-            st.session_state.address_book = []
+            AddressBookManager.load_from_file()
         if "client_history" not in st.session_state:
-            st.session_state.client_history = []
+            HistoryManager.load_from_file()
         if "clients" not in st.session_state:
             st.session_state.clients = []
         if "coord_cache" not in st.session_state:
             st.session_state.coord_cache = {}
         if "contact_index" not in st.session_state:
             st.session_state.contact_index = {}
-        
-        if "data_loaded" not in st.session_state:
-            AddressBookManager.load_from_file()
-            HistoryManager.load_from_file()
             StateManager._invalidate_contact_index()
-            st.session_state.data_loaded = True
 
     @staticmethod
     def _invalidate_contact_index():
         book = st.session_state.get("address_book", [])
-        st.session_state.contact_index = {str(c.get('name', '')).lower(): c for c in book if 'name' in c}
-        # --- INTERFACE ET LOGIQUE ---
-def main():
-    # Correctif CSS pour éviter le titre coupé sur mobile
-    st.markdown("""
-        <style>
-            .block-container { padding-top: 2rem; padding-bottom: 1rem; }
-            h1 { line-height: 1.4; padding-bottom: 10px; font-size: 1.8rem !important; }
-            .stButton>button { width: 100%; border-radius: 6px; height: 3em; background-color: #007bff; color: white; }
-            .stExpander { border: 1px solid #ddd; border-radius: 8px; margin-bottom: 5px; }
-        </style>
-        """, unsafe_allow_html=True)
+        st.session_state.contact_index = {c['name'].lower(): c for c in book if 'name' in c}
 
+# --- LOGIQUE DE GÉOCODAGE ET CALCUL ---
+
+class Geocoder:
+    """Géocodage avec cache"""
+    @staticmethod
+    def get_coords(address: str) -> Optional[Tuple[float, float]]:
+        norm = _norm_addr(address)
+        if norm in st.session_state.coord_cache:
+            return st.session_state.coord_cache[norm]
+        
+        # Test API Gouvernementale (BAN) - Prioritaire pour la France
+        try:
+            url = f"https://api-adresse.data.gouv.fr/search/?q={address}&limit=1"
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if data['features']:
+                    coords = data['features'][0]['geometry']['coordinates']
+                    res = (float(coords[1]), float(coords[0]))
+                    st.session_state.coord_cache[norm] = res
+                    return res
+        except:
+            pass
+        return None
+
+# --- INTERFACE ET MAIN ---
+
+def main():
+    import requests # Import local pour Streamlit Cloud
     StateManager.init_state()
     
     st.title("🚚 ItinéraireMalin - Ramonage")
-
-    # --- BARRE LATÉRALE ---
+    
+    # Barre latérale : Paramètres de la tournée
     with st.sidebar:
         st.header("⚙️ Paramètres")
+        start_addr = st.text_input("🏠 Adresse de départ/retour", "Paris, France")
         
-        # Sélection sécurisée depuis le carnet
-        contacts_list = st.session_state.get("address_book", [])
-        contact_names = ["-- Nouveau client --"] + [str(c.get('name', 'Sans nom')) for c in contacts_list]
+        st.divider()
+        st.subheader("👥 Ajouter un client")
         
-        sel = st.selectbox("Rechercher un client", contact_names)
+        # Sélection depuis carnet ou manuel
+        contact_names = ["-- Nouveau client --"] + [c['name'] for c in st.session_state.address_book]
+        sel = st.selectbox("Carnet d'adresses", contact_names)
         
         with st.form("add_client_form", clear_on_submit=True):
             if sel != "-- Nouveau client --":
@@ -160,49 +230,20 @@ def main():
                 addr = st.text_input("Adresse")
             
             tw = st.selectbox("Disponibilité", ["Libre Matin", "Libre Après-midi", "Heure Fixe"])
-            fixed = st.text_input("Heure (ex: 10:30)", "")
+            fixed = st.text_input("Heure (si fixe, ex: 10:30)", "")
             
             if st.form_submit_button("➕ Ajouter à la tournée"):
                 if name and addr:
-                    new_c = Client(id=str(time.time()), name=name, address=addr, time_window=tw, fixed_time=fixed)
+                    new_c = Client(id=str(time.time()), name=name, address=addr, time_window=tw, fixed_time=fixed if fixed else None)
                     st.session_state.clients.append(new_c)
-                    st.success(f"Ajouté : {name}")
+                    st.toast(f"Client {name} ajouté !")
                     st.rerun()
 
-    # --- CORPS DE LA PAGE ---
-    col_main, col_info = st.columns([2, 1])
-    
-    with col_main:
-        st.subheader(f"📍 Liste du jour ({len(st.session_state.clients)})")
-        if not st.session_state.clients:
-            st.info("Utilisez la barre latérale pour ajouter des clients.")
-        else:
-            for idx, c in enumerate(st.session_state.clients):
-                with st.expander(f"👤 {c.name} - {c.time_window}"):
-                    st.write(f"🏠 **Adresse :** {c.address}")
-                    if c.fixed_time:
-                        st.write(f"⏰ **Heure fixe :** {c.fixed_time}")
-                    if st.button(f"🗑️ Retirer {c.name}", key=f"del_{idx}"):
-                        st.session_state.clients.pop(idx)
-                        st.rerun()
-
-        if st.session_state.clients:
-            st.divider()
-            if st.button("🚀 CALCULER L'ITINÉRAIRE", type="primary"):
-                st.info("Calcul en cours via OSRM... (Pensez à bien renseigner les adresses complètes)")
-
-    with col_info:
-        st.subheader("💾 Données")
-        if st.button("☁️ Synchroniser vers GSheets"):
-            if AddressBookManager.save_to_file():
-                st.success("✅ Contacts sauvegardés !")
-        
-        if st.button("🔄 Actualiser la liste"):
-            AddressBookManager.load_from_file()
-            StateManager._invalidate_contact_index()
-            st.rerun()
-            
-        st.caption("Assurez-vous que votre Google Sheet possède les onglets 'Contacts' et 'Historique'.")
-
-if __name__ == "__main__":
-    main()
+    # --- AFFICHAGE DE LA LISTE ---
+    st.subheader(f"📍 Clients prévus ({len(st.session_state.clients)})")
+    if not st.session_state.clients:
+        st.info("Ajoutez des clients pour commencer.")
+    else:
+        for idx, c in enumerate(st.session_state.clients):
+            col1, col2, col3 = st.columns([3, 2, 1])
+            col
