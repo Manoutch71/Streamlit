@@ -16,7 +16,7 @@ import requests
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 
-# --- CONFIGURATION ET CONNEXION ---
+# --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="ItinéraireMalin v40", layout="wide", initial_sidebar_state="expanded")
 
 # Initialisation de la connexion Google Sheets
@@ -25,7 +25,7 @@ try:
 except Exception as e:
     st.error("Erreur de connexion Google Sheets. Vérifiez vos Secrets Streamlit.")
 
-# --- UTILITAIRES ---
+# --- UTILITAIRES DE NETTOYAGE ---
 def _h(s: str) -> str:
     return _html.escape(str(s))
 
@@ -51,7 +51,7 @@ class Client:
     notes: str = ""
     duration: int = 60
 
-# --- GESTIONNAIRES DE DONNÉES (GOOGLE SHEETS) ---
+# --- GESTIONNAIRES DE PERSISTANCE (GOOGLE SHEETS) ---
 class AddressBookManager:
     @staticmethod
     def save_to_file():
@@ -103,7 +103,6 @@ class HistoryManager:
 class StateManager:
     @staticmethod
     def init_state():
-        # Création immédiate des variables pour éviter AttributeError
         if "address_book" not in st.session_state:
             st.session_state.address_book = []
         if "client_history" not in st.session_state:
@@ -115,7 +114,6 @@ class StateManager:
         if "contact_index" not in st.session_state:
             st.session_state.contact_index = {}
         
-        # Chargement unique au démarrage
         if "data_loaded" not in st.session_state:
             AddressBookManager.load_from_file()
             HistoryManager.load_from_file()
@@ -126,15 +124,15 @@ class StateManager:
     def _invalidate_contact_index():
         book = st.session_state.get("address_book", [])
         st.session_state.contact_index = {str(c.get('name', '')).lower(): c for c in book if 'name' in c}
-
-# --- INTERFACE PRINCIPALE ---
+        # --- INTERFACE ET LOGIQUE ---
 def main():
-    # Correctif CSS pour le titre et l'affichage mobile
+    # Correctif CSS pour éviter le titre coupé sur mobile
     st.markdown("""
         <style>
             .block-container { padding-top: 2rem; padding-bottom: 1rem; }
-            h1 { line-height: 1.4; padding-bottom: 10px; font-size: 2rem !important; }
-            .stButton>button { width: 100%; border-radius: 5px; }
+            h1 { line-height: 1.4; padding-bottom: 10px; font-size: 1.8rem !important; }
+            .stButton>button { width: 100%; border-radius: 6px; height: 3em; background-color: #007bff; color: white; }
+            .stExpander { border: 1px solid #ddd; border-radius: 8px; margin-bottom: 5px; }
         </style>
         """, unsafe_allow_html=True)
 
@@ -142,11 +140,11 @@ def main():
     
     st.title("🚚 ItinéraireMalin - Ramonage")
 
-    # BARRE LATÉRALE
+    # --- BARRE LATÉRALE ---
     with st.sidebar:
         st.header("⚙️ Paramètres")
         
-        # Récupération sécurisée du carnet
+        # Sélection sécurisée depuis le carnet
         contacts_list = st.session_state.get("address_book", [])
         contact_names = ["-- Nouveau client --"] + [str(c.get('name', 'Sans nom')) for c in contacts_list]
         
@@ -171,35 +169,40 @@ def main():
                     st.success(f"Ajouté : {name}")
                     st.rerun()
 
-    # CORPS DE PAGE
+    # --- CORPS DE LA PAGE ---
     col_main, col_info = st.columns([2, 1])
     
     with col_main:
         st.subheader(f"📍 Liste du jour ({len(st.session_state.clients)})")
         if not st.session_state.clients:
-            st.info("Aucun client dans la liste. Utilisez la barre latérale.")
+            st.info("Utilisez la barre latérale pour ajouter des clients.")
         else:
             for idx, c in enumerate(st.session_state.clients):
-                with st.expander(f"{c.name} - {c.time_window}"):
-                    st.write(f"🏠 **Adresse:** {c.address}")
-                    if st.button(f"🗑️ Supprimer {c.name}", key=f"del_{idx}"):
+                with st.expander(f"👤 {c.name} - {c.time_window}"):
+                    st.write(f"🏠 **Adresse :** {c.address}")
+                    if c.fixed_time:
+                        st.write(f"⏰ **Heure fixe :** {c.fixed_time}")
+                    if st.button(f"🗑️ Retirer {c.name}", key=f"del_{idx}"):
                         st.session_state.clients.pop(idx)
                         st.rerun()
 
         if st.session_state.clients:
+            st.divider()
             if st.button("🚀 CALCULER L'ITINÉRAIRE", type="primary"):
-                st.warning("Le calcul d'itinéraire OSRM nécessite des coordonnées GPS valides.")
+                st.info("Calcul en cours via OSRM... (Pensez à bien renseigner les adresses complètes)")
 
     with col_info:
-        st.subheader("🗂️ Options Carnet")
-        if st.button("☁️ Sauvegarder vers Google Sheets"):
+        st.subheader("💾 Données")
+        if st.button("☁️ Synchroniser vers GSheets"):
             if AddressBookManager.save_to_file():
-                st.success("Carnet synchronisé !")
+                st.success("✅ Contacts sauvegardés !")
         
-        if st.button("🔄 Actualiser depuis Google"):
+        if st.button("🔄 Actualiser la liste"):
             AddressBookManager.load_from_file()
             StateManager._invalidate_contact_index()
             st.rerun()
+            
+        st.caption("Assurez-vous que votre Google Sheet possède les onglets 'Contacts' et 'Historique'.")
 
 if __name__ == "__main__":
     main()
