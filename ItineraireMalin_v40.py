@@ -3513,6 +3513,23 @@ def main():
         # ── CSS global : masquer sidebar, max-width 14" ──────────────────
         st.markdown("""
 <style>
+/* ── Polices emoji sur Linux (Streamlit Cloud) ── */
+* {
+    font-family:
+        "Segoe UI Emoji",      /* Windows */
+        "Apple Color Emoji",   /* macOS / iOS */
+        "Noto Color Emoji",    /* Linux / Android */
+        "Twemoji Mozilla",
+        "EmojiOne Color",
+        sans-serif !important;
+}
+/* ── Titre principal : ne pas couper ── */
+h1 {
+    white-space: nowrap !important;
+    overflow: visible !important;
+    text-overflow: unset !important;
+    width: 100% !important;
+}
 /* Masquer complètement la sidebar */
 section[data-testid="stSidebar"] { display: none !important; }
 button[data-testid="baseButton-headerNoPadding"] { display: none !important; }
