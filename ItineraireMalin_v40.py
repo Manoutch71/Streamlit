@@ -3248,7 +3248,7 @@ div[data-testid="block-container"] {
     max-width: 1100px !important;
     padding-left: 1.5rem !important;
     padding-right: 1.5rem !important;
-    padding-top: 1rem !important;
+    padding-top: 2rem !important;
     margin-left: auto !important;
     margin-right: auto !important;
 }
