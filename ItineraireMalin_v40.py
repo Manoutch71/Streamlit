@@ -13,30 +13,6 @@ import io
 import os
 import re
 
-# ── Google Sheets backend ─────────────────────────────────────────────────────
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials as _GCreds
-    _GSPREAD_OK = True
-except ImportError:
-    _GSPREAD_OK = False
-
-SPREADSHEET_ID = "1bDl80sKpN7TFHFxgc2SlU7ejqhO4qZyI2MnJrj0I-lM"
-_GS_SCOPES     = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-# Noms des feuilles dans le Google Sheet
-SHEET_HISTORIQUE = "historique"
-SHEET_CARNET     = "carnet"
-
-# En-têtes des feuilles
-HDR_HIST   = ["visit_date","name","address","phone",
-              "service_duration","intervention_type","notes","time_mode"]
-HDR_CARNET = ["name","address","phone","service_duration",
-              "intervention_type","notes","time_mode"]
-
 def _h(s: str) -> str:
     """Échappe les caractères HTML dans une chaîne utilisateur."""
     return _html.escape(str(s))
@@ -92,26 +68,13 @@ def _import_folium():
 # CONFIGURATION
 # ==========================================================
 st.set_page_config(layout="wide", page_title="ItinéraireMalin v40")
-
-# ── Indicateur Google Sheets ───────────────────────────────────────────────────
-def _gs_status_badge():
-    if not _GSPREAD_OK:
-        return "ߔ gspread non installé"
-    if GSheetBackend._ok:
-        return "ߟ Google Sheets connecté"
-    err = st.session_state.get("_gsheet_error","")
-    if err:
-        return f"ߟ GSheets: {err[:60]}"
-    return "⚪ Google Sheets non initialisé"
-
 st.markdown(
     "<div id='haut-de-page'></div>"
     "<h1 style='text-align:center; font-size:42px;'>ߚ ItinéraireMalin</h1>",
     unsafe_allow_html=True
 )
 
-OSRM_URL         = "http://router.project-osrm.org"
-OSRM_FALLBACK_URL = "https://routing.openstreetmap.de"
+OSRM_URL      = "http://router.project-osrm.org"
 MAP_CENTER    = [48.087411375094675, 6.728658955145458]
 
 SPH = 3600   # seconds per hour
@@ -146,6 +109,7 @@ INTERVENTION_KEYS = list(INTERVENTION_TYPES.keys())
 @dataclass
 class DeliveryPoint:
     address: str
+    name: str = ""                  # nom du client — pour distinguer deux personnes à la même adresse
     coordinates: Optional[Tuple[float, float]] = None
     time_mode: str = "Libre"
     target_time: Optional[int] = None
@@ -227,8 +191,7 @@ class StateManager:
             "opt_pause_start":  12 * SPH,   # 12h00
             "opt_pause_end":    13 * SPH,   # 13h00
             "opt_max_matin_dur":  4 * SPH,  # Objectif matin 4h
-            "opt_max_matin_slots": 4,
-    "osrm_time_coeff":      1.15,  # +15% sur les temps OSRM (routes sinueuses)       # max arrêts matin
+            "opt_max_matin_slots": 4,       # max arrêts matin
         }
         for k, v in defaults.items():
             if k not in st.session_state:
@@ -259,6 +222,7 @@ class StateManager:
         StateManager.add_point(h.get("address", ""))
         pts = st.session_state.delivery_points
         if pts:
+            pts[-1].name              = h.get("name", "")
             pts[-1].intervention_type = h.get("intervention_type", "Standard")
             pts[-1].notes             = h.get("notes", "")
             pts[-1].time_mode         = h.get("time_mode", "Libre")
@@ -269,6 +233,7 @@ class StateManager:
         """Ajoute un contact du carnet directement comme point de la tournée."""
         point = DeliveryPoint(
             address=contact_dict["address"],
+            name=contact_dict.get("name", ""),
             intervention_type=contact_dict.get("intervention_type", "Standard_60"),
             notes=contact_dict.get("notes", ""),
             service_duration=contact_dict.get("service_duration", 60 * SPM)
@@ -333,13 +298,19 @@ class StateManager:
             return
         today_str     = datetime.today().strftime("%d/%m/%Y")
         history       = ss.client_history
-        history_index = {h["address"]: h for h in history}
-        # Index nom depuis le carnet d'adresses
-        name_index    = {c["address"]: c.get("name","") for c in ss.get("address_book", [])}
+        # Clé composite (nom normalisé, adresse normalisée) — deux personnes
+        # à la même adresse restent des entrées distinctes.
+        history_index = {
+            (_norm_addr(h.get("name", "")), _norm_addr(h["address"])): h
+            for h in history
+        }
+        # p.name est porté par le DeliveryPoint lui-même — toujours correct
+        # même si deux personnes partagent la même adresse.
         for p in pts:
-            p_name = name_index.get(p.address, "")
-            if p.address in history_index:
-                entry = history_index[p.address]
+            p_name   = p.name
+            hist_key = (_norm_addr(p_name), _norm_addr(p.address))
+            if hist_key in history_index:
+                entry = history_index[hist_key]
                 entry.update({
                     "intervention_type": p.intervention_type,
                     "notes":             p.notes,
@@ -362,7 +333,7 @@ class StateManager:
                     "visit_dates":       [today_str],
                 }
                 history.append(new_entry)
-                history_index[p.address] = new_entry
+                history_index[hist_key] = new_entry
             StateManager.update_last_intervention(p.address, today_str)
         ss.client_history = history[-500:]
         HistoryManager.save_to_file()
@@ -456,19 +427,22 @@ class StateManager:
             AddressBookManager.save_to_file()
 
     @staticmethod
-    def delete_from_history(address: str):
-        """Supprime un client de l'historique ET du carnet (par adresse normalisée)."""
-        key = _norm_addr(address)
-        # Historique
+    def delete_from_history(address: str, name: str = ""):
+        """Supprime un client de l'historique ET du carnet (clé nom+adresse)."""
+        addr_key = _norm_addr(address)
+        name_key = _norm_addr(name)
+        # Historique : supprime uniquement l'entrée dont nom ET adresse correspondent
         st.session_state.client_history = [
             h for h in st.session_state.get("client_history", [])
-            if _norm_addr(h.get("address", "")) != key
+            if not (_norm_addr(h.get("address", "")) == addr_key
+                    and _norm_addr(h.get("name", "")) == name_key)
         ]
         HistoryManager.save_to_file()
-        # Carnet
+        # Carnet : idem
         st.session_state.address_book = [
             c for c in st.session_state.get("address_book", [])
-            if _norm_addr(c.get("address", "")) != key
+            if not (_norm_addr(c.get("address", "")) == addr_key
+                    and _norm_addr(c.get("name", "")) == name_key)
         ]
         StateManager._invalidate_csv_cache()
         StateManager._invalidate_contact_index()
@@ -781,28 +755,19 @@ class AddressBookManager:
     
     @staticmethod
     def save_to_file():
-        """Sauvegarde le carnet dans Google Sheets (+ JSON local en fallback)."""
-        GSheetBackend.save_carnet()
-
-    @staticmethod
-    def load_from_file():
-        """Charge le carnet depuis Google Sheets (+ JSON local en fallback)."""
-        return GSheetBackend.load_carnet()
-
-    # ── Méthodes locales (fallback) ─────────────────────────────────────────
-    @staticmethod
-    def _save_local():
+        """Sauvegarde automatique du carnet dans un fichier JSON"""
         try:
             contacts = st.session_state.get("address_book", [])
             with open(AddressBookManager.SAVE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(contacts, f, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
-            st.error(f"Erreur sauvegarde locale carnet : {e}")
+            st.error(f"Erreur sauvegarde : {e}")
             return False
-
+    
     @staticmethod
-    def _load_local():
+    def load_from_file():
+        """Charge le carnet depuis le fichier JSON au démarrage"""
         try:
             if os.path.exists(AddressBookManager.SAVE_FILE):
                 with open(AddressBookManager.SAVE_FILE, 'r', encoding='utf-8') as f:
@@ -812,7 +777,7 @@ class AddressBookManager:
                 return len(contacts)
             return 0
         except Exception as e:
-            st.error(f"Erreur chargement local carnet : {e}")
+            st.error(f"Erreur chargement : {e}")
             return 0
     
     @staticmethod
@@ -837,8 +802,10 @@ class AddressBookManager:
             extrasaction='ignore'
         )
         writer.writeheader()
-        hist_idx = {_norm_addr(h["address"]): h
-                    for h in st.session_state.get("client_history", [])}
+        hist_idx = {
+            (_norm_addr(h.get("name", "")), _norm_addr(h["address"])): h
+            for h in st.session_state.get("client_history", [])
+        }
         for contact in contacts:
             base = {
                 "name":              contact["name"],
@@ -848,7 +815,9 @@ class AddressBookManager:
                 "intervention_type": contact.get("intervention_type", ""),
                 "notes":             contact.get("notes", ""),
             }
-            hist     = hist_idx.get(_norm_addr(contact["address"]), {})
+            hist  = hist_idx.get(
+                (_norm_addr(contact.get("name", "")), _norm_addr(contact["address"])), {}
+            )
             dates    = hist.get("visit_dates", [])
             if dates:
                 for d in sorted(dates, key=_sort_key_date):
@@ -992,216 +961,32 @@ class AddressBookManager:
         return content.encode('utf-8-sig')
 
 # ==========================================================
-# GOOGLE SHEETS BACKEND
-# ==========================================================
-class GSheetBackend:
-    """
-    Persistance via Google Sheets.
-    - Feuille "historique" : une ligne par passage (visit_date × client).
-    - Feuille "carnet"     : une ligne par contact (sans dates).
-    Authentification via st.secrets["gcp_service_account"] (service account JSON).
-    Fallback silencieux sur les fichiers JSON locaux si gspread est absent
-    ou si les secrets ne sont pas configurés.
-    """
-
-    _client = None          # gspread.Client (singleton)
-    _sheet  = None          # Spreadsheet handle
-    _ok     = False         # True si la connexion est établie
-
-    # ── Connexion ──────────────────────────────────────────────────────────
-    @classmethod
-    def _connect(cls):
-        if cls._client is not None:
-            return cls._ok
-        if not _GSPREAD_OK:
-            return False
-        try:
-            info = dict(st.secrets["gcp_service_account"])
-            creds = _GCreds.from_service_account_info(info, scopes=_GS_SCOPES)
-            cls._client = gspread.authorize(creds)
-            cls._sheet  = cls._client.open_by_key(SPREADSHEET_ID)
-            cls._ok     = True
-        except Exception as e:
-            st.session_state["_gsheet_error"] = str(e)
-            cls._ok = False
-        return cls._ok
-
-    @classmethod
-    def _ws(cls, name: str, headers: list):
-        """Retourne (crée si nécessaire) un onglet avec ses en-têtes."""
-        try:
-            ws = cls._sheet.worksheet(name)
-        except gspread.WorksheetNotFound:
-            ws = cls._sheet.add_worksheet(title=name, rows=5000, cols=len(headers))
-            ws.append_row(headers, value_input_option="RAW")
-        return ws
-
-    # ── Historique ─────────────────────────────────────────────────────────
-    @classmethod
-    def load_history(cls) -> int:
-        """Charge l'historique depuis Google Sheets → session_state.client_history."""
-        if not cls._connect():
-            return HistoryManager._load_local()
-        try:
-            ws   = cls._ws(SHEET_HISTORIQUE, HDR_HIST)
-            rows = ws.get_all_records(default_blank="")
-            # Grouper par (name, address)
-            from collections import defaultdict
-            idx: dict = {}
-            for r in rows:
-                name  = r.get("name","").strip()
-                addr  = r.get("address","").strip()
-                key   = (_norm_addr(name), _norm_addr(addr))
-                if key not in idx:
-                    idx[key] = {
-                        "name":              name,
-                        "address":           addr,
-                        "phone":             r.get("phone",""),
-                        "service_duration":  int(r.get("service_duration") or 3600),
-                        "intervention_type": r.get("intervention_type","Standard"),
-                        "notes":             r.get("notes",""),
-                        "time_mode":         r.get("time_mode","Libre"),
-                        "visit_dates":       [],
-                    }
-                vd = r.get("visit_date","").strip()
-                if vd and vd not in idx[key]["visit_dates"]:
-                    idx[key]["visit_dates"].append(vd)
-            history = list(idx.values())
-            st.session_state.client_history = history
-            return len(history)
-        except Exception as e:
-            st.session_state["_gsheet_error"] = f"Chargement historique: {e}"
-            return HistoryManager._load_local()
-
-    @classmethod
-    def save_history(cls):
-        """Écrit l'historique complet dans la feuille Google Sheets."""
-        if not cls._connect():
-            HistoryManager._save_local()
-            return
-        try:
-            history = st.session_state.get("client_history", [])
-            rows    = [HDR_HIST]
-            for h in history:
-                base = [
-                    "",                                    # visit_date — rempli ci-dessous
-                    h.get("name",""),
-                    h.get("address",""),
-                    h.get("phone",""),
-                    str(h.get("service_duration", 3600)),
-                    h.get("intervention_type","Standard"),
-                    h.get("notes",""),
-                    h.get("time_mode","Libre"),
-                ]
-                dates = h.get("visit_dates",[])
-                if dates:
-                    for d in dates:
-                        r    = base[:]
-                        r[0] = d
-                        rows.append(r)
-                else:
-                    rows.append(base)
-            ws = cls._ws(SHEET_HISTORIQUE, HDR_HIST)
-            ws.clear()
-            ws.update(rows, value_input_option="RAW")
-        except Exception as e:
-            st.session_state["_gsheet_error"] = f"Sauvegarde historique: {e}"
-            HistoryManager._save_local()
-
-    # ── Carnet ─────────────────────────────────────────────────────────────
-    @classmethod
-    def load_carnet(cls) -> int:
-        """Charge le carnet depuis Google Sheets → session_state.address_book."""
-        if not cls._connect():
-            return AddressBookManager._load_local()
-        try:
-            ws      = cls._ws(SHEET_CARNET, HDR_CARNET)
-            rows    = ws.get_all_records(default_blank="")
-            contacts = []
-            for r in rows:
-                try:
-                    sd = int(r.get("service_duration") or 3600)
-                except Exception:
-                    sd = 3600
-                contacts.append({
-                    "name":              r.get("name",""),
-                    "address":           r.get("address",""),
-                    "phone":             r.get("phone",""),
-                    "service_duration":  sd,
-                    "intervention_type": r.get("intervention_type","Standard"),
-                    "notes":             r.get("notes",""),
-                    "time_mode":         r.get("time_mode","Libre"),
-                })
-            st.session_state.address_book = contacts
-            StateManager._invalidate_contact_index()
-            return len(contacts)
-        except Exception as e:
-            st.session_state["_gsheet_error"] = f"Chargement carnet: {e}"
-            return AddressBookManager._load_local()
-
-    @classmethod
-    def save_carnet(cls):
-        """Écrit le carnet complet dans la feuille Google Sheets."""
-        if not cls._connect():
-            AddressBookManager._save_local()
-            return
-        try:
-            contacts = st.session_state.get("address_book", [])
-            rows     = [HDR_CARNET]
-            for c in contacts:
-                rows.append([
-                    c.get("name",""),
-                    c.get("address",""),
-                    c.get("phone",""),
-                    str(c.get("service_duration",3600)),
-                    c.get("intervention_type","Standard"),
-                    c.get("notes",""),
-                    c.get("time_mode","Libre"),
-                ])
-            ws = cls._ws(SHEET_CARNET, HDR_CARNET)
-            ws.clear()
-            ws.update(rows, value_input_option="RAW")
-        except Exception as e:
-            st.session_state["_gsheet_error"] = f"Sauvegarde carnet: {e}"
-            AddressBookManager._save_local()
-
-# ==========================================================
 # HISTORY MANAGER
 # ==========================================================
 class HistoryManager:
-    """Gère la persistance de l'historique des clients (visit_dates).
-    Utilise Google Sheets comme backend principal (via GSheetBackend),
-    avec fallback sur fichier JSON local si gspread est indisponible."""
+    """Gère la persistance de l'historique des clients (visit_dates)."""
     SAVE_FILE = "historique_clients.json"
 
-    # ── Méthodes publiques (appelées depuis le reste de l'app) ─────────────
     @staticmethod
     def save_to_file():
-        GSheetBackend.save_history()
-
-    @staticmethod
-    def load_from_file():
-        return GSheetBackend.load_history()
-
-    # ── Méthodes locales (fallback) ─────────────────────────────────────────
-    @staticmethod
-    def _save_local():
         try:
             history = st.session_state.get("client_history", [])
             with open(HistoryManager.SAVE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            st.error(f"Erreur sauvegarde historique local : {e}")
+            st.error(f"Erreur sauvegarde historique : {e}")
 
     @staticmethod
-    def _load_local() -> int:
+    def load_from_file():
         try:
             if os.path.exists(HistoryManager.SAVE_FILE):
                 with open(HistoryManager.SAVE_FILE, 'r', encoding='utf-8') as f:
                     history = json.load(f)
+                # Migration : garantir que visit_dates existe
                 for h in history:
                     if "visit_dates" not in h:
                         h["visit_dates"] = [h["last_intervention"]] if h.get("last_intervention") else []
+                    # Migration : garantir que name existe
                     if "name" not in h:
                         h["name"] = ""
                 st.session_state.client_history = history
@@ -1643,28 +1428,17 @@ class OSRM:
 
             # Requête OSRM uniquement pour les points manquants
             if missing_indices:
-                sub_idx    = sorted(missing_indices)
+                sub_idx  = sorted(missing_indices)
                 sub_coords = [coords[i] for i in sub_idx]
                 s = ";".join(f"{lon},{lat}" for lat, lon in sub_coords)
-                d = None
-                for base_url in (OSRM_URL, OSRM_FALLBACK_URL):
-                    try:
-                        r = OSRM._get_session().get(
-                            f"{base_url}/table/v1/driving/{s}?annotations=distance,duration",
-                            timeout=15
-                        )
-                        r.raise_for_status()
-                        d = r.json()
-                        if "distances" in d and "durations" in d:
-                            if base_url != OSRM_URL:
-                                st.toast(f"⚠️ Serveur OSRM principal indisponible — serveur de secours utilisé.", icon="⚠️")
-                            break
-                        d = None
-                    except Exception as e:
-                        st.session_state.last_error = f"OSRM ({base_url}): {e}"
-                        d = None
-                if d is None:
-                    st.session_state.last_error = "OSRM indisponible (serveur principal et de secours)"
+                r = OSRM._get_session().get(
+                    f"{OSRM_URL}/table/v1/driving/{s}?annotations=distance,duration",
+                    timeout=30
+                )
+                r.raise_for_status()
+                d = r.json()
+                if "distances" not in d or "durations" not in d:
+                    st.session_state.last_error = "Réponse OSRM invalide"
                     return None
                 sub_pts = [pts[i] for i in sub_idx]
                 for si, pi in enumerate(sub_pts):
@@ -1672,10 +1446,9 @@ class OSRM:
                         dist_cache[(pi, pj)] = d["distances"][si][sj]
                         dur_cache [(pi, pj)] = d["durations"][si][sj]
 
-            # Assembler la matrice + appliquer le coefficient correcteur sur les durées
-            coeff = st.session_state.get("osrm_time_coeff", 1.15)
+            # Assembler la matrice complète depuis le cache
             dist_m = [[dist_cache.get((pts[i], pts[j]), 0.0) for j in range(n)] for i in range(n)]
-            dur_s  = [[dur_cache.get ((pts[i], pts[j]), 0.0) * coeff for j in range(n)] for i in range(n)]
+            dur_s  = [[dur_cache.get ((pts[i], pts[j]), 0.0) for j in range(n)] for i in range(n)]
             return (dist_m, dur_s)
 
         except Exception as e:
@@ -1965,7 +1738,7 @@ class Optimizer:
             return list(candidates)
 
         # ── Held-Karp : solution optimale garantie pour les petites sous-chaînes ──
-        HELD_KARP_THRESHOLD = 13   # exact DP — 2^13=8192 états, <100ms, parfait jusqu'à 13 arrêts
+        HELD_KARP_THRESHOLD = 11   # exact DP — 2^11=2048 états, trivial en <20ms
         if len(candidates) <= HELD_KARP_THRESHOLD:
             return Optimizer.held_karp(candidates, start, end, dist)
 
@@ -2112,7 +1885,7 @@ class Optimizer:
 
         # ── Randomized construction / Held-Karp selon taille ──────────────
         n_trials = max(5, min(20, n_pts * 3))
-        HELD_KARP_THRESHOLD = 13   # même seuil que _randomized_best_chain
+        HELD_KARP_THRESHOLD = 11   # même seuil que _randomized_best_chain
         # Tournée optimale garantie si toutes les sous-chaînes rentrent dans HK
         is_optimal = (
             len(chain_matin) <= HELD_KARP_THRESHOLD and
@@ -2637,40 +2410,10 @@ class UI:
 
     @staticmethod
     def params_tab():
-        """Contenu de l'onglet Paramètres — fragment beta."""
-        if HAS_FRAGMENT:
-            @st.fragment
-            def _run():
-                UI._params_tab_body()
-            _run()
-        else:
-            UI._params_tab_body()
-
-    @staticmethod
-    def _params_tab_body():
-        """Corps de l'onglet Paramètres (séparé pour fragmentation)."""
+        """Contenu de l'onglet Paramètres (ancienne sidebar)."""
         cfg      = StateManager.config()
         contacts = StateManager.get_contacts()
 
-        # ── Statut Google Sheets ─────────────────────────────────────────────
-        st.caption(_gs_status_badge())
-        if st.session_state.get("_gsheet_error"):
-            with st.expander("⚠️ Détail de l'erreur Google Sheets"):
-                st.code(st.session_state["_gsheet_error"])
-        if GSheetBackend._ok:
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("ߔ Synchroniser depuis Sheets", key="gs_pull"):
-                    GSheetBackend.load_history()
-                    GSheetBackend.load_carnet()
-                    st.toast("✅ Données rechargées depuis Google Sheets")
-            with c2:
-                if st.button("⬆️ Pousser vers Sheets", key="gs_push"):
-                    GSheetBackend.save_history()
-                    GSheetBackend.save_carnet()
-                    st.toast("✅ Données envoyées vers Google Sheets")
-
-        st.markdown("---")
         # ── Mise en page 2 colonnes pour écran 14" ───────────────────────
         col_depart, col_options = st.columns(2, gap="large")
 
@@ -2702,7 +2445,7 @@ class UI:
             val = st.text_input("Adresse de départ", key="si_start")
             if val != cfg.start_address:
                 StateManager.update_config(start_address=val, start_coordinates=None)
-                StateManager.commit(do_rerun=False)
+                StateManager.commit()
 
             c_t, c_s = st.columns(2)
             with c_t:
@@ -2713,14 +2456,14 @@ class UI:
                 ts = ti.hour * SPH + ti.minute * SPM
                 if ts != cfg.start_time:
                     StateManager.update_config(start_time=ts)
-                    StateManager.commit(do_rerun=False)
+                    StateManager.commit()
             with c_s:
                 svc_dep_min = st.number_input("Durée sur place (min)", 0, 180,
                                               value=cfg.start_service_duration // SPM,
                                               step=5, key="si_svc_dep")
                 if svc_dep_min * SPM != cfg.start_service_duration:
                     StateManager.update_config(start_service_duration=int(svc_dep_min) * SPM)
-                    StateManager.commit(do_rerun=False)
+                    StateManager.commit()
 
             st.markdown("---")
             # ── Retour ───────────────────────────────────────────────────
@@ -2750,21 +2493,19 @@ class UI:
             val_end = st.text_input("Adresse de retour", key="si_end")
             if val_end != cfg.end_address:
                 StateManager.update_config(end_address=val_end, end_coordinates=None)
-                StateManager.commit(do_rerun=False)
+                StateManager.commit()
 
         with col_options:
             # ── Optimiseur ───────────────────────────────────────────────
             st.markdown("#### ⚙️ Paramètres optimiseur")
             if st.session_state.pop("_reset_params_pending", False):
                 for k, v in [("inp_ps_h",12),("inp_ps_m",0),("inp_pe_h",13),
-                             ("inp_pe_m",0),("inp_max_dur",4),("inp_max_slots",4),
-                             ("inp_osrm_coeff", 15)]:
+                             ("inp_pe_m",0),("inp_max_dur",4),("inp_max_slots",4)]:
                     st.session_state[k] = v
                 st.session_state.opt_pause_start     = 12 * SPH
                 st.session_state.opt_pause_end       = 13 * SPH
                 st.session_state.opt_max_matin_dur   = 4  * SPH
                 st.session_state.opt_max_matin_slots = 4
-                st.session_state["osrm_time_coeff"]  = 1.15
 
             if "inp_ps_h"      not in st.session_state: st.session_state["inp_ps_h"]      = st.session_state.opt_pause_start // SPH
             if "inp_ps_m"      not in st.session_state: st.session_state["inp_ps_m"]      = (st.session_state.opt_pause_start % SPH) // SPM
@@ -2787,38 +2528,21 @@ class UI:
                 if new_pe > new_ps:
                     st.session_state.opt_pause_start = new_ps
                     st.session_state.opt_pause_end   = new_pe
-                    StateManager.commit(do_rerun=False)
+                    StateManager.commit()
                 else:
                     st.warning("La fin de pause doit être après le début.")
 
             new_max_dur = st.slider("Objectif matin (h)", 1, 6, key="inp_max_dur")
             if new_max_dur * SPH != st.session_state.opt_max_matin_dur:
                 st.session_state.opt_max_matin_dur = new_max_dur * SPH
-                StateManager.commit(do_rerun=False)
+                StateManager.commit()
             new_max_slots = st.slider("Max arrêts matin", 1, 10, key="inp_max_slots")
             if new_max_slots != st.session_state.opt_max_matin_slots:
                 st.session_state.opt_max_matin_slots = new_max_slots
-                StateManager.commit(do_rerun=False)
-
-            st.markdown("---")
-            st.caption("ߛ️ Correction temps de trajet OSRM")
-            coeff_pct = st.slider(
-                "Marge sur les temps calculés (%)", 0, 40,
-                value=int(round((st.session_state.get("osrm_time_coeff", 1.15) - 1.0) * 100)),
-                step=5, key="inp_osrm_coeff",
-                help="OSRM calcule des temps théoriques. +15% recommandé pour routes sinueuses (Vosges)."
-            )
-            new_coeff = 1.0 + coeff_pct / 100.0
-            if abs(new_coeff - st.session_state.get("osrm_time_coeff", 1.15)) > 0.001:
-                st.session_state["osrm_time_coeff"] = new_coeff
-                st.session_state.pop("_osrm_pair_dur", None)   # invalider le cache durées
-                StateManager.commit(do_rerun=False)
-            st.caption(f"Temps OSRM × {new_coeff:.2f}")
-
+                StateManager.commit()
             if st.button("↩️ Remettre par défaut", key="reset_params"):
                 st.session_state["_reset_params_pending"] = True
-                StateManager.commit(do_rerun=False)
-                st.rerun()
+                StateManager.commit()
 
 
 
@@ -3903,7 +3627,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
 
                     with st.expander(
                         f"ߓ Contacts {start_i+1}–{min(start_i+HIST_PAGE_SIZE, n_total)}",
-                        expanded=True
+                        expanded=False
                     ):
                         for fi, (h, dates) in enumerate(page_items):
                             h_name = h.get("name","")
@@ -3936,7 +3660,8 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                 # Bouton éditer — cherche le contact correspondant dans le carnet
                                 h_cidx = StateManager._get_contact_index()
                                 match_c = [(ci, cc) for ci, nl, al, cc in h_cidx
-                                           if _norm_addr(cc["address"]) == _norm_addr(h_addr)]
+                                           if _norm_addr(cc["address"]) == _norm_addr(h_addr)
+                                           and _norm_addr(cc.get("name","")) == _norm_addr(h_name)]
                                 if match_c:
                                     if st.button("✎", key=f"hist_edit_{start_i+fi}",
                                                  help="Modifier ce contact"):
@@ -3946,7 +3671,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                 if st.session_state.get(confirm_key):
                                     if st.button("✅", key=f"hist_del_ok_{start_i+fi}",
                                                  help="Confirmer la suppression"):
-                                        StateManager.delete_from_history(h_addr)
+                                        StateManager.delete_from_history(h_addr, h_name)
                                         st.session_state[confirm_key] = False
                                         st.rerun()
                                 else:
@@ -3959,7 +3684,8 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                             if st.session_state.get(f"editing_hist_{start_i+fi}", False):
                                 h_cidx2 = StateManager._get_contact_index()
                                 match_c2 = [(ci, cc) for ci, nl, al, cc in h_cidx2
-                                            if _norm_addr(cc["address"]) == _norm_addr(h_addr)]
+                                            if _norm_addr(cc["address"]) == _norm_addr(h_addr)
+                                            and _norm_addr(cc.get("name","")) == _norm_addr(h_name)]
                                 if match_c2:
                                     orig_ci2, contact_c2 = match_c2[0]
 
@@ -4163,7 +3889,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
 
         st.markdown(
             "<div style='text-align:center;color:gray;font-size:0.8em;margin-top:2em'>"
-            "ItinéraireMalin v40 &nbsp;·&nbsp; "
+            "ItinéraireMalin v41 &nbsp;·&nbsp; "
             "⭐ Exact solver ≤11 stops &nbsp;·&nbsp; "
             "⚡ Heuristique >11"
             "</div>", unsafe_allow_html=True
