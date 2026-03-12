@@ -12,10 +12,30 @@ import csv
 import io
 import os
 import re
-from streamlit_gsheets import GSheetsConnection
-import pandas as pd
-# Initialisation de la connexion Google Sheets
-conn = st.connection("gsheets", type=GSheetsConnection)
+
+# ── Google Sheets backend ─────────────────────────────────────────────────────
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials as _GCreds
+    _GSPREAD_OK = True
+except ImportError:
+    _GSPREAD_OK = False
+
+SPREADSHEET_ID = "1bDl80sKpN7TFHFxgc2SlU7ejqhO4qZyI2MnJrj0I-lM"
+_GS_SCOPES     = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# Noms des feuilles dans le Google Sheet
+SHEET_HISTORIQUE = "historique"
+SHEET_CARNET     = "carnet"
+
+# En-têtes des feuilles
+HDR_HIST   = ["visit_date","name","address","phone",
+              "service_duration","intervention_type","notes","time_mode"]
+HDR_CARNET = ["name","address","phone","service_duration",
+              "intervention_type","notes","time_mode"]
 
 def _h(s: str) -> str:
     """Échappe les caractères HTML dans une chaîne utilisateur."""
@@ -72,6 +92,18 @@ def _import_folium():
 # CONFIGURATION
 # ==========================================================
 st.set_page_config(layout="wide", page_title="ItinéraireMalin v40")
+
+# ── Indicateur Google Sheets ───────────────────────────────────────────────────
+def _gs_status_badge():
+    if not _GSPREAD_OK:
+        return "ߔ gspread non installé"
+    if GSheetBackend._ok:
+        return "ߟ Google Sheets connecté"
+    err = st.session_state.get("_gsheet_error","")
+    if err:
+        return f"ߟ GSheets: {err[:60]}"
+    return "⚪ Google Sheets non initialisé"
+
 st.markdown(
     "<div id='haut-de-page'></div>"
     "<h1 style='text-align:center; font-size:42px;'>ߚ ItinéraireMalin</h1>",
@@ -726,44 +758,61 @@ class GeoCache:
 # ADDRESS BOOK MANAGER - Sauvegarde/Chargement/Import/Export
 # ==========================================================
 class AddressBookManager:
-    """Gère la persistance du carnet d'adresses via Google Sheets"""
+    """Gère la persistance du carnet d'adresses"""
+
+    SAVE_FILE = "carnet_adresses.json"
     
-@staticmethod
-    def decode_csv_bytes(b: bytes) -> str:
-        """Décode un fichier CSV binaire en texte (gère UTF-8 et Excel)"""
-        for enc in ['utf-8', 'latin-1', 'cp1252']:
+    @staticmethod
+    def decode_csv_bytes(csv_bytes: bytes) -> str:
+        """
+        Décode les bytes du CSV en essayant différents encodages.
+        Gère UTF-8 avec BOM (Excel), Windows-1252 et Latin-1.
+        """
+        encodings = ['utf-8-sig', 'utf-8', 'cp1252', 'iso-8859-1', 'latin1']
+
+        for encoding in encodings:
             try:
-                return b.decode(enc)
-            except:
+                return csv_bytes.decode(encoding)
+            except (UnicodeDecodeError, AttributeError):
                 continue
-        return b.decode('utf-8', errors='ignore')
-        
+
+        # En dernier recours : latin1 (ne peut pas lever d'exception)
+        return csv_bytes.decode('latin1', errors='replace')
+    
     @staticmethod
     def save_to_file():
-        """Sauvegarde les contacts vers Google Sheets"""
-        try:
-            contacts = st.session_state.get("address_book", [])
-            if contacts:
-                df = pd.DataFrame(contacts)
-                # On met à jour la feuille "Contacts"
-                conn.update(worksheet="Contacts", data=df)
-            return True
-        except Exception as e:
-            st.error(f"Erreur sauvegarde Google Sheets : {e}")
-            return False
+        """Sauvegarde le carnet dans Google Sheets (+ JSON local en fallback)."""
+        GSheetBackend.save_carnet()
 
     @staticmethod
     def load_from_file():
-        """Charge le carnet depuis Google Sheets au démarrage"""
+        """Charge le carnet depuis Google Sheets (+ JSON local en fallback)."""
+        return GSheetBackend.load_carnet()
+
+    # ── Méthodes locales (fallback) ─────────────────────────────────────────
+    @staticmethod
+    def _save_local():
         try:
-            # On lit la feuille "Contacts" avec ttl=0 pour avoir les données fraîches
-            df = conn.read(worksheet="Contacts", ttl=0)
-            df = df.dropna(how='all') # Supprime les lignes vides
-            contacts = df.to_dict('records')
-            st.session_state.address_book = contacts
-            StateManager._invalidate_contact_index()
-            return len(contacts)
-        except Exception:
+            contacts = st.session_state.get("address_book", [])
+            with open(AddressBookManager.SAVE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(contacts, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            st.error(f"Erreur sauvegarde locale carnet : {e}")
+            return False
+
+    @staticmethod
+    def _load_local():
+        try:
+            if os.path.exists(AddressBookManager.SAVE_FILE):
+                with open(AddressBookManager.SAVE_FILE, 'r', encoding='utf-8') as f:
+                    contacts = json.load(f)
+                st.session_state.address_book = contacts
+                StateManager._invalidate_contact_index()
+                return len(contacts)
+            return 0
+        except Exception as e:
+            st.error(f"Erreur chargement local carnet : {e}")
             return 0
     
     @staticmethod
@@ -943,28 +992,221 @@ class AddressBookManager:
         return content.encode('utf-8-sig')
 
 # ==========================================================
+# GOOGLE SHEETS BACKEND
+# ==========================================================
+class GSheetBackend:
+    """
+    Persistance via Google Sheets.
+    - Feuille "historique" : une ligne par passage (visit_date × client).
+    - Feuille "carnet"     : une ligne par contact (sans dates).
+    Authentification via st.secrets["gcp_service_account"] (service account JSON).
+    Fallback silencieux sur les fichiers JSON locaux si gspread est absent
+    ou si les secrets ne sont pas configurés.
+    """
+
+    _client = None          # gspread.Client (singleton)
+    _sheet  = None          # Spreadsheet handle
+    _ok     = False         # True si la connexion est établie
+
+    # ── Connexion ──────────────────────────────────────────────────────────
+    @classmethod
+    def _connect(cls):
+        if cls._client is not None:
+            return cls._ok
+        if not _GSPREAD_OK:
+            return False
+        try:
+            info = dict(st.secrets["gcp_service_account"])
+            creds = _GCreds.from_service_account_info(info, scopes=_GS_SCOPES)
+            cls._client = gspread.authorize(creds)
+            cls._sheet  = cls._client.open_by_key(SPREADSHEET_ID)
+            cls._ok     = True
+        except Exception as e:
+            st.session_state["_gsheet_error"] = str(e)
+            cls._ok = False
+        return cls._ok
+
+    @classmethod
+    def _ws(cls, name: str, headers: list):
+        """Retourne (crée si nécessaire) un onglet avec ses en-têtes."""
+        try:
+            ws = cls._sheet.worksheet(name)
+        except gspread.WorksheetNotFound:
+            ws = cls._sheet.add_worksheet(title=name, rows=5000, cols=len(headers))
+            ws.append_row(headers, value_input_option="RAW")
+        return ws
+
+    # ── Historique ─────────────────────────────────────────────────────────
+    @classmethod
+    def load_history(cls) -> int:
+        """Charge l'historique depuis Google Sheets → session_state.client_history."""
+        if not cls._connect():
+            return HistoryManager._load_local()
+        try:
+            ws   = cls._ws(SHEET_HISTORIQUE, HDR_HIST)
+            rows = ws.get_all_records(default_blank="")
+            # Grouper par (name, address)
+            from collections import defaultdict
+            idx: dict = {}
+            for r in rows:
+                name  = r.get("name","").strip()
+                addr  = r.get("address","").strip()
+                key   = (_norm_addr(name), _norm_addr(addr))
+                if key not in idx:
+                    idx[key] = {
+                        "name":              name,
+                        "address":           addr,
+                        "phone":             r.get("phone",""),
+                        "service_duration":  int(r.get("service_duration") or 3600),
+                        "intervention_type": r.get("intervention_type","Standard"),
+                        "notes":             r.get("notes",""),
+                        "time_mode":         r.get("time_mode","Libre"),
+                        "visit_dates":       [],
+                    }
+                vd = r.get("visit_date","").strip()
+                if vd and vd not in idx[key]["visit_dates"]:
+                    idx[key]["visit_dates"].append(vd)
+            history = list(idx.values())
+            st.session_state.client_history = history
+            return len(history)
+        except Exception as e:
+            st.session_state["_gsheet_error"] = f"Chargement historique: {e}"
+            return HistoryManager._load_local()
+
+    @classmethod
+    def save_history(cls):
+        """Écrit l'historique complet dans la feuille Google Sheets."""
+        if not cls._connect():
+            HistoryManager._save_local()
+            return
+        try:
+            history = st.session_state.get("client_history", [])
+            rows    = [HDR_HIST]
+            for h in history:
+                base = [
+                    "",                                    # visit_date — rempli ci-dessous
+                    h.get("name",""),
+                    h.get("address",""),
+                    h.get("phone",""),
+                    str(h.get("service_duration", 3600)),
+                    h.get("intervention_type","Standard"),
+                    h.get("notes",""),
+                    h.get("time_mode","Libre"),
+                ]
+                dates = h.get("visit_dates",[])
+                if dates:
+                    for d in dates:
+                        r    = base[:]
+                        r[0] = d
+                        rows.append(r)
+                else:
+                    rows.append(base)
+            ws = cls._ws(SHEET_HISTORIQUE, HDR_HIST)
+            ws.clear()
+            ws.update(rows, value_input_option="RAW")
+        except Exception as e:
+            st.session_state["_gsheet_error"] = f"Sauvegarde historique: {e}"
+            HistoryManager._save_local()
+
+    # ── Carnet ─────────────────────────────────────────────────────────────
+    @classmethod
+    def load_carnet(cls) -> int:
+        """Charge le carnet depuis Google Sheets → session_state.address_book."""
+        if not cls._connect():
+            return AddressBookManager._load_local()
+        try:
+            ws      = cls._ws(SHEET_CARNET, HDR_CARNET)
+            rows    = ws.get_all_records(default_blank="")
+            contacts = []
+            for r in rows:
+                try:
+                    sd = int(r.get("service_duration") or 3600)
+                except Exception:
+                    sd = 3600
+                contacts.append({
+                    "name":              r.get("name",""),
+                    "address":           r.get("address",""),
+                    "phone":             r.get("phone",""),
+                    "service_duration":  sd,
+                    "intervention_type": r.get("intervention_type","Standard"),
+                    "notes":             r.get("notes",""),
+                    "time_mode":         r.get("time_mode","Libre"),
+                })
+            st.session_state.address_book = contacts
+            StateManager._invalidate_contact_index()
+            return len(contacts)
+        except Exception as e:
+            st.session_state["_gsheet_error"] = f"Chargement carnet: {e}"
+            return AddressBookManager._load_local()
+
+    @classmethod
+    def save_carnet(cls):
+        """Écrit le carnet complet dans la feuille Google Sheets."""
+        if not cls._connect():
+            AddressBookManager._save_local()
+            return
+        try:
+            contacts = st.session_state.get("address_book", [])
+            rows     = [HDR_CARNET]
+            for c in contacts:
+                rows.append([
+                    c.get("name",""),
+                    c.get("address",""),
+                    c.get("phone",""),
+                    str(c.get("service_duration",3600)),
+                    c.get("intervention_type","Standard"),
+                    c.get("notes",""),
+                    c.get("time_mode","Libre"),
+                ])
+            ws = cls._ws(SHEET_CARNET, HDR_CARNET)
+            ws.clear()
+            ws.update(rows, value_input_option="RAW")
+        except Exception as e:
+            st.session_state["_gsheet_error"] = f"Sauvegarde carnet: {e}"
+            AddressBookManager._save_local()
+
+# ==========================================================
 # HISTORY MANAGER
 # ==========================================================
 class HistoryManager:
+    """Gère la persistance de l'historique des clients (visit_dates).
+    Utilise Google Sheets comme backend principal (via GSheetBackend),
+    avec fallback sur fichier JSON local si gspread est indisponible."""
+    SAVE_FILE = "historique_clients.json"
+
+    # ── Méthodes publiques (appelées depuis le reste de l'app) ─────────────
     @staticmethod
     def save_to_file():
-        try:
-            history = st.session_state.get("client_history", [])
-            if history:
-                # Convertir les listes de dates en texte pour Google Sheets
-                df = pd.DataFrame(history)
-                conn.update(worksheet="Historique", data=df)
-        except Exception as e:
-            st.error(f"Erreur sauvegarde historique : {e}")
+        GSheetBackend.save_history()
 
     @staticmethod
     def load_from_file():
+        return GSheetBackend.load_history()
+
+    # ── Méthodes locales (fallback) ─────────────────────────────────────────
+    @staticmethod
+    def _save_local():
         try:
-            df = conn.read(worksheet="Historique", ttl=0)
-            df = df.dropna(how='all')
-            history = df.to_dict('records')
-            st.session_state.client_history = history
-            return len(history)
+            history = st.session_state.get("client_history", [])
+            with open(HistoryManager.SAVE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            st.error(f"Erreur sauvegarde historique local : {e}")
+
+    @staticmethod
+    def _load_local() -> int:
+        try:
+            if os.path.exists(HistoryManager.SAVE_FILE):
+                with open(HistoryManager.SAVE_FILE, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                for h in history:
+                    if "visit_dates" not in h:
+                        h["visit_dates"] = [h["last_intervention"]] if h.get("last_intervention") else []
+                    if "name" not in h:
+                        h["name"] = ""
+                st.session_state.client_history = history
+                return len(history)
+            return 0
         except Exception:
             return 0
 
@@ -2410,6 +2652,25 @@ class UI:
         cfg      = StateManager.config()
         contacts = StateManager.get_contacts()
 
+        # ── Statut Google Sheets ─────────────────────────────────────────────
+        st.caption(_gs_status_badge())
+        if st.session_state.get("_gsheet_error"):
+            with st.expander("⚠️ Détail de l'erreur Google Sheets"):
+                st.code(st.session_state["_gsheet_error"])
+        if GSheetBackend._ok:
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("ߔ Synchroniser depuis Sheets", key="gs_pull"):
+                    GSheetBackend.load_history()
+                    GSheetBackend.load_carnet()
+                    st.toast("✅ Données rechargées depuis Google Sheets")
+            with c2:
+                if st.button("⬆️ Pousser vers Sheets", key="gs_push"):
+                    GSheetBackend.save_history()
+                    GSheetBackend.save_carnet()
+                    st.toast("✅ Données envoyées vers Google Sheets")
+
+        st.markdown("---")
         # ── Mise en page 2 colonnes pour écran 14" ───────────────────────
         col_depart, col_options = st.columns(2, gap="large")
 
@@ -3202,23 +3463,7 @@ class UI:
         # ── Auto-ajout au carnet : détection des adresses absentes ──────────
         today_str = datetime.today().strftime("%d/%m/%Y")
         StateManager.auto_add_to_book(points, result.arrival_times, result.order, today_str)
-        
-# Créez la connexion (à mettre avant la fonction main)
-conn = st.connection("gsheets", type=GSheetsConnection)
 
-def load_from_gsheets():
-    """Charge les contacts depuis Google Sheets"""
-    try:
-        df = conn.read(ttl=0) # ttl=0 pour forcer la lecture fraîche
-        return df.to_dict('records')
-    except:
-        return []
-
-def save_to_gsheets(data):
-    """Sauvegarde les contacts vers Google Sheets"""
-    df = pd.DataFrame(data)
-    conn.update(data=df)
-    st.success("Données synchronisées avec Google Sheets !")
 # ==========================================================
 # MAIN
 # ==========================================================
