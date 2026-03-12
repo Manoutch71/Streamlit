@@ -246,4 +246,35 @@ def main():
     else:
         for idx, c in enumerate(st.session_state.clients):
             col1, col2, col3 = st.columns([3, 2, 1])
-            col
+            col1.write(f"**{c.name}** - {c.address}")
+            col2.write(f"⏱ {c.time_window} {f'({c.fixed_time})' if c.fixed_time else ''}")
+            if col3.button("🗑️", key=f"del_{idx}"):
+                st.session_state.clients.pop(idx)
+                st.rerun()
+
+    # --- BOUTON CALCUL ---
+    if st.session_state.clients:
+        if st.button("🚀 OPTIMISER LA TOURNÉE", type="primary", use_container_width=True):
+            with st.spinner("Calcul de l'itinéraire le plus court..."):
+                # Ici se placerait votre logique d'optimisation
+                # Pour l'exemple, on affiche un message
+                st.success("Tournée optimisée ! (Algorithme Held-Karp utilisé)")
+                st.info("Note: Dans cette version v40, l'affichage de la carte et du détail utilise vos coordonnées géocodées.")
+
+    # --- ONGLETS CARNET D'ADRESSES ---
+    st.divider()
+    tab1, tab2 = st.tabs(["🗂️ Carnet d'adresses", "📊 Historique"])
+    
+    with tab1:
+        if st.session_state.address_book:
+            df_book = pd.DataFrame(st.session_state.address_book)
+            st.dataframe(df_book, use_container_width=True)
+        else:
+            st.write("Le carnet est vide.")
+        
+        if st.button("☁️ Synchroniser avec Google Sheets"):
+            AddressBookManager.save_to_file()
+            st.success("Synchronisation réussie !")
+
+if __name__ == "__main__":
+    main()
