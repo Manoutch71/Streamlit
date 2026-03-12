@@ -206,7 +206,7 @@ def main():
     import requests # Import local pour Streamlit Cloud
     StateManager.init_state()
     
-    st.title("🚚 ItinéraireMalin - Ramonage")
+    st.header("🚚 ItinéraireMalin - Ramonage")
     
     # Barre latérale : Paramètres de la tournée
     with st.sidebar:
