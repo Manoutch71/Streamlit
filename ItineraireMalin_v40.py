@@ -727,7 +727,17 @@ class GeoCache:
 # ==========================================================
 class AddressBookManager:
     """Gère la persistance du carnet d'adresses via Google Sheets"""
-
+    
+@staticmethod
+    def decode_csv_bytes(b: bytes) -> str:
+        """Décode un fichier CSV binaire en texte (gère UTF-8 et Excel)"""
+        for enc in ['utf-8', 'latin-1', 'cp1252']:
+            try:
+                return b.decode(enc)
+            except:
+                continue
+        return b.decode('utf-8', errors='ignore')
+        
     @staticmethod
     def save_to_file():
         """Sauvegarde les contacts vers Google Sheets"""
