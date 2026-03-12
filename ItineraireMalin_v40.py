@@ -96,17 +96,17 @@ st.set_page_config(layout="wide", page_title="ItinéraireMalin v40")
 # ── Indicateur Google Sheets ───────────────────────────────────────────────────
 def _gs_status_badge():
     if not _GSPREAD_OK:
-        return "ERR gspread non installé"
+        return "ߔ gspread non installé"
     if GSheetBackend._ok:
-        return "OK  Google Sheets connecté"
+        return "ߟ Google Sheets connecté"
     err = st.session_state.get("_gsheet_error","")
     if err:
-        return f"ERR GSheets: {err[:60]}"
-    return "... Google Sheets non initialisé"
+        return f"ߟ GSheets: {err[:60]}"
+    return "⚪ Google Sheets non initialisé"
 
 st.markdown(
     "<div id='haut-de-page'></div>"
-    "<h1 style='text-align:center; font-size:42px;'>ItinéraireMalin</h1>",
+    "<h1 style='text-align:center; font-size:42px;'>ߚ ItinéraireMalin</h1>",
     unsafe_allow_html=True
 )
 
@@ -132,18 +132,10 @@ DEBUT_APM   = 13 * SPH   # 46800
 
 # Types d'intervention ramonage avec durées par défaut
 INTERVENTION_TYPES = {
-    "Rapide (30 min)":            30 * SPM,
-    "Standard (60 min)":          60 * SPM,
-    "Difficile (90 min)":         90 * SPM,
-    "Conduits multiples (120 min)": 120 * SPM,
-}
-# Migration anciens noms → nouveaux
-_ITYPE_MIGRATION = {
-    "Rapide_30":              "Rapide (30 min)",
-    "Standard_60":            "Standard (60 min)",
-    "Standard":               "Standard (60 min)",
-    "Difficile_90":           "Difficile (90 min)",
-    "Conduits multiples_120": "Conduits multiples (120 min)",
+    "Rapide_30": 30 * SPM,
+    "Standard_60": 60 * SPM,
+    "Difficile_90": 90 * SPM,
+    "Conduits multiples_120": 120 * SPM,
 }
 # F: liste des clés pré-calculée — évite list(INTERVENTION_TYPES.keys()) répété à chaque rerun UI
 INTERVENTION_KEYS = list(INTERVENTION_TYPES.keys())
@@ -157,7 +149,7 @@ class DeliveryPoint:
     coordinates: Optional[Tuple[float, float]] = None
     time_mode: str = "Libre"
     target_time: Optional[int] = None
-    intervention_type: str = "Standard (60 min)"
+    intervention_type: str = "Standard"
     notes: str = ""
     service_duration: int = 60 * SPM
 
@@ -175,7 +167,7 @@ class Contact:
     name: str
     address: str
     phone: str = ""
-    intervention_type: str = "Standard (60 min)"
+    intervention_type: str = "Standard"
     notes: str = ""
     service_duration: int = 60 * SPM
 
@@ -267,7 +259,7 @@ class StateManager:
         StateManager.add_point(h.get("address", ""))
         pts = st.session_state.delivery_points
         if pts:
-            pts[-1].intervention_type = h.get("intervention_type", "Standard (60 min)")
+            pts[-1].intervention_type = h.get("intervention_type", "Standard")
             pts[-1].notes             = h.get("notes", "")
             pts[-1].time_mode         = h.get("time_mode", "Libre")
             pts[-1].service_duration  = h.get("service_duration", 3600)
@@ -907,9 +899,8 @@ class AddressBookManager:
                             raw_date = ""
 
                     itype = row.get("intervention_type", "").strip()
-                    itype = _ITYPE_MIGRATION.get(itype, itype)
                     if itype not in INTERVENTION_TYPES:
-                        itype = "Standard (60 min)"
+                        itype = "Standard"
                     try:
                         sd_raw = row.get("service_duration", "").strip()
                         duration_sec = int(sd_raw) * 60 if sd_raw else 3600
@@ -1062,14 +1053,12 @@ class GSheetBackend:
                 addr  = r.get("address","").strip()
                 key   = (_norm_addr(name), _norm_addr(addr))
                 if key not in idx:
-                    itype_raw = r.get("intervention_type","Standard (60 min)")
-                    itype = _ITYPE_MIGRATION.get(itype_raw, itype_raw)
                     idx[key] = {
                         "name":              name,
                         "address":           addr,
                         "phone":             r.get("phone",""),
                         "service_duration":  int(r.get("service_duration") or 3600),
-                        "intervention_type": itype,
+                        "intervention_type": r.get("intervention_type","Standard"),
                         "notes":             r.get("notes",""),
                         "time_mode":         r.get("time_mode","Libre"),
                         "visit_dates":       [],
@@ -1100,7 +1089,7 @@ class GSheetBackend:
                     h.get("address",""),
                     h.get("phone",""),
                     str(h.get("service_duration", 3600)),
-                    h.get("intervention_type","Standard (60 min)"),
+                    h.get("intervention_type","Standard"),
                     h.get("notes",""),
                     h.get("time_mode","Libre"),
                 ]
@@ -1139,7 +1128,7 @@ class GSheetBackend:
                     "address":           r.get("address",""),
                     "phone":             r.get("phone",""),
                     "service_duration":  sd,
-                    "intervention_type": r.get("intervention_type","Standard (60 min)"),
+                    "intervention_type": r.get("intervention_type","Standard"),
                     "notes":             r.get("notes",""),
                     "time_mode":         r.get("time_mode","Libre"),
                 })
@@ -1165,7 +1154,7 @@ class GSheetBackend:
                     c.get("address",""),
                     c.get("phone",""),
                     str(c.get("service_duration",3600)),
-                    c.get("intervention_type","Standard (60 min)"),
+                    c.get("intervention_type","Standard"),
                     c.get("notes",""),
                     c.get("time_mode","Libre"),
                 ])
@@ -1701,7 +1690,7 @@ class Optimizer:
     PAUSE_END   = 13 * SPH
 
     # ──────────────────────────────────────────────────────
-    # ◆ Cheapest Insertion  (meilleure init que Nearest Neighbor)
+    # ߧ Cheapest Insertion  (meilleure init que Nearest Neighbor)
     # Principe : part du nœud le plus éloigné du dépôt, insère
     # chaque nœud restant à sa position de coût minimal.
     # Gain typique : -15 à -25 % vs Nearest Neighbor.
@@ -2496,7 +2485,7 @@ class UI:
             def _dlg():
                 new_addr = st.text_input("Adresse", value=address, key="edit_addr_input")
                 if new_addr and Geo.is_incomplete_address(new_addr):
-                    st.caption("◇ Pas de code postal — géocodage peut échouer")
+                    st.caption("ߒ Pas de code postal — géocodage peut échouer")
                 col_ok, col_no = st.columns(2)
                 with col_ok:
                     if st.button("✅ Valider", type="primary",
@@ -2541,7 +2530,7 @@ class UI:
     def _confirm_delete_point(idx: int, address: str):
         """Ouvre une confirmation avant de supprimer un point de la tournée."""
         if HAS_DIALOG:
-            @st.dialog("Supprimer ce point ?")
+            @st.dialog("ߗ️ Supprimer ce point ?")
             def _dlg():
                 st.write(f"**{address}**")
                 st.caption("Cette action supprimera le point de la tournée en cours.")
@@ -2580,7 +2569,7 @@ class UI:
     def _confirm_delete_save(save_name: str):
         """Ouvre une confirmation avant de supprimer une sauvegarde."""
         if HAS_DIALOG:
-            @st.dialog("Supprimer la sauvegarde ?")
+            @st.dialog("ߗ️ Supprimer la sauvegarde ?")
             def _dlg():
                 st.write(f"**« {save_name} »**")
                 st.caption("Cette action est irréversible.")
@@ -2609,12 +2598,12 @@ class UI:
                     "mais ont des créneaux sur des **demi-journées opposées**.")
                 for (i, j) in conflicts:
                     pi, pj = pts[i], pts[j]
-                    ci = "Matin" if "Matin" in pi.time_mode or (
+                    ci = "ߌ Matin" if "Matin" in pi.time_mode or (
                         pi.time_mode == "Heure précise" and pi.target_time
-                        and pi.target_time < 43200) else "APM"
-                    cj = "Matin" if "Matin" in pj.time_mode or (
+                        and pi.target_time < 43200) else "ߌ APM"
+                    cj = "ߌ Matin" if "Matin" in pj.time_mode or (
                         pj.time_mode == "Heure précise" and pj.target_time
-                        and pj.target_time < 43200) else "APM"
+                        and pj.target_time < 43200) else "ߌ APM"
                     st.info(f"• **{pi.address[:45]}** ({ci})  ↔  **{pj.address[:45]}** ({cj})")
                 st.markdown("---")
                 col_ok, col_no = st.columns(2)
@@ -2635,8 +2624,8 @@ class UI:
             st.warning("⚠️ **Adresses proches avec créneaux incompatibles**")
             for (i, j) in conflicts:
                 pi, pj = pts[i], pts[j]
-                ci = "Matin" if "Matin" in pi.time_mode else "APM"
-                cj = "Matin" if "Matin" in pj.time_mode else "APM"
+                ci = "ߌ Matin" if "Matin" in pi.time_mode else "ߌ APM"
+                cj = "ߌ Matin" if "Matin" in pj.time_mode else "ߌ APM"
                 st.info(f"• **{pi.address[:40]}** ({ci})  ↔  **{pj.address[:40]}** ({cj})")
             col_ok, col_no = st.columns(2)
             with col_ok:
@@ -2671,12 +2660,12 @@ class UI:
         if GSheetBackend._ok:
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("Synchroniser depuis Sheets", key="gs_pull"):
+                if st.button("ߔ Synchroniser depuis Sheets", key="gs_pull"):
                     GSheetBackend.load_history()
                     GSheetBackend.load_carnet()
                     st.toast("✅ Données rechargées depuis Google Sheets")
             with c2:
-                if st.button("Pousser vers Sheets", key="gs_push"):
+                if st.button("⬆️ Pousser vers Sheets", key="gs_push"):
                     GSheetBackend.save_history()
                     GSheetBackend.save_carnet()
                     st.toast("✅ Données envoyées vers Google Sheets")
@@ -2687,9 +2676,9 @@ class UI:
 
         with col_depart:
             # ── Départ ───────────────────────────────────────────────────
-            st.markdown("#### Départ")
+            st.markdown("#### ߏ Départ")
             if contacts:
-                with st.expander("Choisir depuis le carnet", expanded=False):
+                with st.expander("ߓ Choisir depuis le carnet", expanded=False):
                     search_dep = st.text_input("Filtrer", placeholder="Nom ou adresse…",
                                                key="dep_book_search", label_visibility="collapsed")
                     sl = search_dep.lower() if search_dep else ""
@@ -2699,7 +2688,7 @@ class UI:
                         options = [f"{n[:25]} — {a[:25]}" for n, a in filtered_dep]
                         choice = st.selectbox("Contact", options, key="dep_book_choice",
                                               label_visibility="collapsed")
-                        if st.button("Utiliser comme depart", key="dep_book_apply",
+                        if st.button("✅ Utiliser comme départ", key="dep_book_apply",
                                      use_container_width=True):
                             chosen_addr = filtered_dep[options.index(choice)][1]
                             StateManager.update_config(start_address=chosen_addr, start_coordinates=None)
@@ -2735,9 +2724,9 @@ class UI:
 
             st.markdown("---")
             # ── Retour ───────────────────────────────────────────────────
-            st.markdown("#### Retour")
+            st.markdown("#### ߏ Retour")
             if contacts:
-                with st.expander("Choisir depuis le carnet", expanded=False):
+                with st.expander("ߓ Choisir depuis le carnet", expanded=False):
                     search_end = st.text_input("Filtrer", placeholder="Nom ou adresse…",
                                                key="end_book_search", label_visibility="collapsed")
                     sl2 = search_end.lower() if search_end else ""
@@ -2747,7 +2736,7 @@ class UI:
                         options_end = [f"{n[:25]} — {a[:25]}" for n, a in filtered_end]
                         choice_end = st.selectbox("Contact", options_end, key="end_book_choice",
                                                   label_visibility="collapsed")
-                        if st.button("Utiliser comme retour", key="end_book_apply",
+                        if st.button("✅ Utiliser comme retour", key="end_book_apply",
                                      use_container_width=True):
                             chosen_addr = filtered_end[options_end.index(choice_end)][1]
                             StateManager.update_config(end_address=chosen_addr, end_coordinates=None)
@@ -2765,7 +2754,7 @@ class UI:
 
         with col_options:
             # ── Optimiseur ───────────────────────────────────────────────
-            st.markdown("#### ⚙ Paramètres optimiseur")
+            st.markdown("#### ⚙️ Paramètres optimiseur")
             if st.session_state.pop("_reset_params_pending", False):
                 for k, v in [("inp_ps_h",12),("inp_ps_m",0),("inp_pe_h",13),
                              ("inp_pe_m",0),("inp_max_dur",4),("inp_max_slots",4),
@@ -2812,7 +2801,7 @@ class UI:
                 StateManager.commit(do_rerun=False)
 
             st.markdown("---")
-            st.caption("Correction temps de trajet OSRM")
+            st.caption("ߛ️ Correction temps de trajet OSRM")
             coeff_pct = st.slider(
                 "Marge sur les temps calculés (%)", 0, 40,
                 value=int(round((st.session_state.get("osrm_time_coeff", 1.15) - 1.0) * 100)),
@@ -2900,7 +2889,7 @@ class UI:
                     st.caption(f"⏱ {p.service_duration//SPM}min")
                 with c4:
                     if arr is not None:
-                        st.write(f"○ **{fmt_t(arr)}**")
+                        st.write(f"ߕ **{fmt_t(arr)}**")
                     else:
                         st.caption("—")
                 with c_btns:
@@ -2916,7 +2905,7 @@ class UI:
                         UI._confirm_delete_point(i, p.address)
 
                 with st.expander(
-                    f" {p.address[:28]}…" if len(p.address) > 28 else f" {p.address}"
+                    f"ߓ {p.address[:28]}…" if len(p.address) > 28 else f"ߓ {p.address}"
                 ):
                     # ── Champ adresse unifié ──────────────────────────────
                     new_address_val = st.text_input(
@@ -2956,7 +2945,7 @@ class UI:
 
                         if in_carnet:
                             orig_idx, contact = addr_idx[addr_l_old]
-                            st.caption(f"Contact : **{contact['name']}**")
+                            st.caption(f"ߓ Contact : **{contact['name']}**")
                             col_t, col_c, col_tc = st.columns(3)
                             with col_t:
                                 if st.button("✅ Tournée",
@@ -2966,7 +2955,7 @@ class UI:
                                     _apply_to_tour()
                                     StateManager.commit()
                             with col_c:
-                                if st.button("Carnet",
+                                if st.button("ߒ Carnet",
                                              key=f"val_carnet_{i}",
                                              use_container_width=True,
                                              help="Met à jour le carnet JSON uniquement"):
@@ -2975,7 +2964,7 @@ class UI:
                                     st.session_state.pop(f"addr_{i}", None)
                                     st.rerun()
                             with col_tc:
-                                if st.button("↺ Tournée + Carnet",
+                                if st.button("ߔ Tournée + Carnet",
                                              key=f"val_both_{i}",
                                              use_container_width=True,
                                              type="primary",
@@ -3038,7 +3027,7 @@ class UI:
                             candidates2  = st.session_state.get("_auto_add_candidates", [])
                             is_cand2     = any(
                                 _norm_addr(c["address"]) == addr_l for c in candidates2)
-                            label2 = "Ajouter au carnet ✨" if is_cand2 else "Ajouter au carnet"
+                            label2 = "ߓ Ajouter au carnet ✨" if is_cand2 else "ߓ Ajouter au carnet"
                             with st.expander(label2, expanded=is_cand2):
                                 col_n3, col_ph3 = st.columns(2)
                                 with col_n3:
@@ -3100,9 +3089,9 @@ class UI:
 
                     tmp = DeliveryPoint(address="", time_mode=mode, target_time=tgt)
                     lo, hi = TW.get(tmp)
-                    icons = {"Heure précise":"⏰","Matin libre":"◑",
-                             "Après-midi libre":"◐","Libre":"○"}
-                    st.caption(f"{icons.get(mode,'○')} Fenêtre : {TW.fmt(lo, hi)}")
+                    icons = {"Heure précise":"⏰","Matin libre":"ߌ",
+                             "Après-midi libre":"ߌ","Libre":"ߕ"}
+                    st.caption(f"{icons.get(mode,'ߕ')} Fenêtre : {TW.fmt(lo, hi)}")
                     if mode == "Heure précise" and tgt is not None:
                         _ps = st.session_state.get("opt_pause_start", 12*SPH)
                         _pe = st.session_state.get("opt_pause_end",   13*SPH)
@@ -3161,13 +3150,13 @@ class UI:
                 lo, hi = TW.get(p)
                 popup_text = f"{i+1}. {p.address}\n{TW.fmt(lo, hi)}\n⏱ {p.service_duration//SPM}min"
                 if p.notes:
-                    popup_text += f"\n✎ {p.notes[:50]}"
+                    popup_text += f"\nߓ {p.notes[:50]}"
                 folium.Marker(p.coordinates, popup=popup_text,
                               icon=folium.Icon(color=color, icon="info-sign")).add_to(m)
 
         if cfg.end_coordinates:
             folium.Marker(cfg.end_coordinates,
-                          popup=f"RETOUR: {cfg.end_address}",
+                          popup=f"ߏ RETOUR: {cfg.end_address}",
                           icon=folium.Icon(color="orange", icon="stop")).add_to(m)
 
         if show_route and st.session_state.optimized_result:
@@ -3183,7 +3172,7 @@ class UI:
         if st.session_state.get("map_click_queue"):
             for qi, (qlat, qlon) in enumerate(st.session_state["map_click_queue"]):
                 folium.Marker(location=[qlat, qlon],
-                              popup=f" Point {qi+1}",
+                              popup=f"ߓ Point {qi+1}",
                               icon=folium.Icon(color="cadetblue", icon="plus-sign")).add_to(m)
         return m
 
@@ -3219,7 +3208,7 @@ class UI:
             m.location   = list(center)
             m.zoom_start = zoom
 
-        st.caption("↖ Double-cliquez sur la carte pour sélectionner des points, "
+        st.caption("ߖ️ Double-cliquez sur la carte pour sélectionner des points, "
                    "puis cliquez **Ajouter les points**")
 
         map_data = st_folium(
@@ -3249,7 +3238,7 @@ class UI:
         # ── Affichage de la file d'attente ───────────────────────────────
         queue: list = st.session_state.get("map_click_queue", [])
         if queue:
-            st.info(f" **{len(queue)} point(s) sélectionné(s)** sur la carte")
+            st.info(f"ߓ **{len(queue)} point(s) sélectionné(s)** sur la carte")
             for qi, (qlat, qlon) in enumerate(queue):
                 qc1, qc2 = st.columns([5, 1])
                 with qc1:
@@ -3308,7 +3297,7 @@ class UI:
     @staticmethod
     def results():
         if not st.session_state.optimized_result:
-            st.info("Aucune tournée planifiée. Cliquez sur **⊞ Planifier**.")
+            st.info("Aucune tournée planifiée. Cliquez sur **ߗ️ Planifier**.")
             return
 
         result: RouteResult = st.session_state.optimized_result
@@ -3330,7 +3319,7 @@ class UI:
 
         h_m = result.matin_duration // 3600
         min_m = (result.matin_duration % 3600) // 60
-        badge = "⭐" if not result.is_approximation else "~"
+        badge = "⭐" if not result.is_approximation else "ߓ"
         moved_txt = f" · ⚠️ {len(result.matin_moved)} déplacé(s) PM" if result.matin_moved else ""
         st.caption(f"{badge} Matin : {result.matin_count} arrêt(s) — {h_m}h{min_m:02d}{moved_txt}")
         st.markdown("---")
@@ -3440,8 +3429,8 @@ class UI:
 
         t1, t2, t3 = st.columns(3)
         with t1: st.metric("⏱ Clients",  _fmt_hm(svc_total))
-        with t2: st.metric("Trajets",  _fmt_hm(travel_total))
-        with t3: st.metric("Total",    _fmt_hm(result.total_time))
+        with t2: st.metric("ߚ Trajets",  _fmt_hm(travel_total))
+        with t3: st.metric("ߓ Total",    _fmt_hm(result.total_time))
 
         st.markdown("---")
         st.subheader("Export")
@@ -3452,7 +3441,7 @@ class UI:
                 st.code(gmap_url, language=None)
 
         # ── Export Google Calendar (.ics) ─────────────────────────────────
-        st.markdown("**~ Exporter vers Google Calendar**")
+        st.markdown("**ߓ Exporter vers Google Calendar**")
         tour_date = st.date_input(
             "Date de la tournée",
             value=datetime.today().date(),
@@ -3463,7 +3452,7 @@ class UI:
             datetime(tour_date.year, tour_date.month, tour_date.day)
         )
         st.download_button(
-            label="Télécharger le fichier .ics (Google Calendar / iCal)",
+            label="ߓ Télécharger le fichier .ics (Google Calendar / iCal)",
             data=ics_content,
             file_name=f"tournee_{tour_date.strftime('%Y%m%d')}.ics",
             mime="text/calendar",
@@ -3491,7 +3480,7 @@ def main():
                 + [p.coordinates for p in pts]
                 + [cfg.end_coordinates]
             )
-            with st.spinner("Mise à jour de la tournée…"):
+            with st.spinner("ߔ Mise à jour de la tournée…"):
                 mats = OSRM.matrix(all_coords)
             if mats:
                 result = Optimizer.optimize(cfg, pts, precomputed_mats=mats)
@@ -3507,7 +3496,7 @@ def main():
             col_msg, col_yes, col_no = st.columns([5, 1, 1])
             with col_msg:
                 st.info(
-                    f"Tournée non terminée détectée ({info['n_pts']} arrêt(s), "
+                    f"ߒ Tournée non terminée détectée ({info['n_pts']} arrêt(s), "
                     f"sauvegardée le {info['saved_at'][:16].replace('T',' ')}). "
                     "Voulez-vous la restaurer ?"
                 )
@@ -3517,30 +3506,13 @@ def main():
                     del st.session_state["_autosave_available"]
                     st.rerun()
             with col_no:
-                if st.button("Ignorer", use_container_width=True):
+                if st.button("ߗ️ Ignorer", use_container_width=True):
                     del st.session_state["_autosave_available"]
                     st.rerun()
 
         # ── CSS global : masquer sidebar, max-width 14" ──────────────────
         st.markdown("""
 <style>
-/* ── Polices emoji sur Linux (Streamlit Cloud) ── */
-* {
-    font-family:
-        "Segoe UI Emoji",      /* Windows */
-        "Apple Color Emoji",   /* macOS / iOS */
-        "Noto Color Emoji",    /* Linux / Android */
-        "Twemoji Mozilla",
-        "EmojiOne Color",
-        sans-serif !important;
-}
-/* ── Titre principal : ne pas couper ── */
-h1 {
-    white-space: nowrap !important;
-    overflow: visible !important;
-    text-overflow: unset !important;
-    width: 100% !important;
-}
 /* Masquer complètement la sidebar */
 section[data-testid="stSidebar"] { display: none !important; }
 button[data-testid="baseButton-headerNoPadding"] { display: none !important; }
@@ -3588,13 +3560,13 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
         # FENÊTRE PRINCIPALE — ONGLETS NAVIGATEUR
         # ══════════════════════════════════════════════════════════════════
         tab_tournee, tab_contacts, tab_search, tab_params, tab_csv = st.tabs([
-            "Planification", "Contacts", "Rechercher", "⚙ Paramètres", "Import / Export"
+            "ߗ️ Planification", "ߓ Contacts", "ߔ Rechercher", "⚙️ Paramètres", "ߓߓ Import / Export"
         ])
 
         with tab_tournee:
             # ── Bouton afficher/masquer la carte ─────────────────────────
             map_visible = st.session_state.get("map_visible", False)
-            if st.button("Masquer la carte" if map_visible else "Afficher la carte",
+            if st.button("ߗ️ Masquer la carte" if map_visible else "ߗ️ Afficher la carte",
                          key="btn_toggle_map"):
                 st.session_state["map_visible"] = not map_visible
                 st.rerun()
@@ -3605,12 +3577,12 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
             col_btn, col_geo, col_save, col_load = st.columns([1, 1, 3, 3])
 
             with col_btn:
-                run_optim = st.button("⊞", type="primary",
+                run_optim = st.button("ߗ️", type="primary",
                                       use_container_width=False, key="btn_planifier",
-                                      help="Planifier la tournée optimale ✓")
+                                      help="Planifier la tournée optimale ߘ")
 
             with col_geo:
-                _do_geocode = st.button("", key="btn_geocode_main",
+                _do_geocode = st.button("ߓ", key="btn_geocode_main",
                                         help="Géocoder toutes les adresses",
                                         use_container_width=False)
             if _do_geocode:
@@ -3636,10 +3608,10 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                     st.success(f"✅ {ok} adresse(s) géocodée(s)" + (f" · ❌ {fail} échouée(s)" if fail else ""))
 
             with col_save:
-                with st.expander("Sauvegarder", expanded=False):
+                with st.expander("ߒ Sauvegarder", expanded=False):
                     save_name = st.text_input("Nom", placeholder="Lundi_S42",
                                               key="save_route_name")
-                    if st.button("Sauvegarder", key="btn_save_route",
+                    if st.button("ߒ Sauvegarder", key="btn_save_route",
                                  use_container_width=True, type="primary"):
                         if save_name.strip():
                             clean = _RE_SAFE_NAME.sub('',
@@ -3651,7 +3623,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                             st.warning("Donnez un nom")
 
             with col_load:
-                with st.expander("Charger", expanded=False):
+                with st.expander("ߓ Charger", expanded=False):
                     saves = RouteManager.list_saves()
                     if saves:
                         selected_save = st.selectbox("Tournée", saves,
@@ -3659,7 +3631,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                                      label_visibility="collapsed")
                         c_load, c_del = st.columns(2)
                         with c_load:
-                            if st.button("Charger", key="btn_load_route",
+                            if st.button("ߓ Charger", key="btn_load_route",
                                          use_container_width=True, type="primary"):
                                 if RouteManager.load(selected_save):
                                     st.rerun()
@@ -3695,7 +3667,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                 elif not pts:
                     st.error("Ajoutez au moins un point d'arrêt")
                 else:
-                    _status = st.status("Planification en cours…", expanded=True)
+                    _status = st.status("ߗ️ Planification en cours…", expanded=True)
                     with _status:
                         addrs_needed: List[str] = []
                         if not cfg.start_coordinates:
@@ -3762,7 +3734,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                     + [p.coordinates for p in pts]
                                     + [cfg.end_coordinates]
                                 )
-                                st.write("⊕ Calcul des distances OSRM…")
+                                st.write("ߔ Calcul des distances OSRM…")
                                 mats_check = OSRM.matrix(all_coords_check)
                                 if mats_check is None:
                                     _status.update(label="❌ OSRM indisponible", state="error")
@@ -3797,7 +3769,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
 
             nb_msg = st.session_state.pop("_contacts_loaded_msg", None)
             if nb_msg:
-                st.success(f"☰ {nb_msg} contact(s) importé(s)")
+                st.success(f"ߓ {nb_msg} contact(s) importé(s)")
 
             # ── Filtres historique ──────────────────────────────────────────
             if history:
@@ -3825,7 +3797,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                 with hf4:
                     st.markdown("<label style='font-size:0.85rem;color:transparent'>.</label>",
                                 unsafe_allow_html=True)
-                    if st.button("↺", key="reset_filters",
+                    if st.button("ߔ", key="reset_filters",
                                  help="Réinitialiser les filtres",
                                  use_container_width=True):
                         for k in ("hist_year", "hist_month", "hist_page"):
@@ -3876,7 +3848,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                             col_info, col_btn = st.columns([3, 1])
                             with col_info:
                                 name_part = f"<span style='font-size:1em;font-weight:bold'>{_h(h_name)}</span>" if h_name else ""
-                                addr_part = f"<span style='font-size:0.88em;color:#aaa'> {_h(h_addr[:45])}</span>"
+                                addr_part = f"<span style='font-size:0.88em;color:#aaa'>ߓ {_h(h_addr[:45])}</span>"
                                 st.markdown(
                                     f"<div style='line-height:1.4;margin:2px 0 2px 0'>"
                                     f"{name_part}<br>{addr_part}</div>",
@@ -3886,7 +3858,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                 for di, d in enumerate(all_h_dates):
                                     dc1, dc2 = st.columns([4, 1])
                                     with dc1:
-                                        st.caption(f"~ {d}")
+                                        st.caption(f"ߓ {d}")
                                     with dc2:
                                         if st.button("✕", key=f"qs_del_date_{fi}_{di}",
                                                      help=f"Supprimer le {d}"):
@@ -3912,7 +3884,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                     n_pages  = max(1, (n_total + HIST_PAGE_SIZE - 1) // HIST_PAGE_SIZE)
                     page     = max(0, min(st.session_state.get("hist_page", 0), n_pages - 1))
 
-                    st.caption(f"☰ {n_total} client(s) — page {page+1}/{n_pages}")
+                    st.caption(f"ߓ {n_total} client(s) — page {page+1}/{n_pages}")
                     _hc, _hn, _hp = st.columns([6, 1, 1])
                     with _hn:
                         if st.button("◀", key="hist_prev", disabled=(page == 0),
@@ -3930,23 +3902,23 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                     page_items = filtered[start_i: start_i + HIST_PAGE_SIZE]
 
                     with st.expander(
-                        f"Contacts {start_i+1}–{min(start_i+HIST_PAGE_SIZE, n_total)}",
+                        f"ߓ Contacts {start_i+1}–{min(start_i+HIST_PAGE_SIZE, n_total)}",
                         expanded=True
                     ):
                         for fi, (h, dates) in enumerate(page_items):
                             h_name = h.get("name","")
                             h_addr = h.get("address","")
                             last_visit = sorted(dates, key=_sort_key_date)[-1] if dates else ""
-                            phone_str = (f" · ☏ {_h(h['phone'])}" if h.get("phone") else "")
+                            phone_str = (f" · ߓ {_h(h['phone'])}" if h.get("phone") else "")
                             last_str  = (f"<br><span style='color:#888;font-size:0.88em'>"
-                                         f"⚙ {_h(last_visit)}  ·  {len(dates)} passage(s)</span>"
+                                         f"ߔ {_h(last_visit)}  ·  {len(dates)} passage(s)</span>"
                                          if last_visit else "")
                             st.markdown(
                                 f"<div style='line-height:1.25;margin:1px 0 3px 0'>"
                                 f"<span style='font-size:1em;font-weight:bold'>"
                                 f"{_h(h_name) if h_name else _h(h_addr[:40])}</span>"
                                 f"<span style='font-size:0.88em;color:#aaa'>{phone_str}</span><br>"
-                                + (f"<span style='font-size:0.88em;color:#aaa'> {_h(h_addr[:40])}</span>" if h_name else "")
+                                + (f"<span style='font-size:0.88em;color:#aaa'>ߓ {_h(h_addr[:40])}</span>" if h_name else "")
                                 + f"{last_str}</div>", unsafe_allow_html=True)
 
                             hcol1, hcol2, hcol3, hcol4 = st.columns([2, 1, 1, 1])
@@ -3955,7 +3927,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                     StateManager.add_from_history(h)
                                     StateManager.commit()
                             with hcol2:
-                                if st.button("⌕", key=f"hist_detail_{start_i+fi}",
+                                if st.button("ߔ", key=f"hist_detail_{start_i+fi}",
                                              help="Voir toutes les dates"):
                                     st.session_state[f"hist_expand_{start_i+fi}"] = \
                                         not st.session_state.get(f"hist_expand_{start_i+fi}", False)
@@ -4015,7 +3987,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                                                    key=f"hedit_notes_{_si+_fi}")
                                         cs, cv, cc = st.columns([2, 2, 1])
                                         with cs:
-                                            if st.button("▣ Sauver", key=f"hedit_save_{_si+_fi}",
+                                            if st.button("ߒ Sauver", key=f"hedit_save_{_si+_fi}",
                                                          use_container_width=True):
                                                 if edit_addr.strip() != _cc['address'].strip():
                                                     st.session_state.coord_cache.pop(_norm_addr(_cc['address']), None)
@@ -4027,7 +3999,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                                 st.session_state[f"editing_hist_{_si+_fi}"] = False
                                                 st.rerun()  # rerun global nécessaire : maj liste contacts
                                         with cv:
-                                            if st.button("⌕ Vérifier", key=f"hedit_val_{_si+_fi}",
+                                            if st.button("ߔ Vérifier", key=f"hedit_val_{_si+_fi}",
                                                          use_container_width=True):
                                                 with st.spinner("Géocodage…"):
                                                     coords = Geo._fetch(edit_addr.strip())
@@ -4058,7 +4030,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                     for di, d in enumerate(all_h_dates):
                                         dc1, dc2 = st.columns([3, 1])
                                         with dc1:
-                                            st.caption(f"~ {d}")
+                                            st.caption(f"ߓ {d}")
                                         with dc2:
                                             if st.button("✕", key=f"del_date_{start_i+fi}_{di}",
                                                          help=f"Supprimer le {d}"):
@@ -4085,7 +4057,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                            index=1, key="new_contact_type")
                 new_notes   = st.text_area("Notes", key="new_contact_notes",
                                            placeholder="Ex: Cheminée difficile…", height=80)
-                if st.button("▣ Enregistrer le contact", type="primary",
+                if st.button("ߒ Enregistrer le contact", type="primary",
                              use_container_width=True):
                     if new_name and new_address:
                         if StateManager.is_duplicate_contact(new_name, new_address):
@@ -4104,11 +4076,11 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                         st.warning("Nom et adresse requis")
 
         with tab_search:
-            st.markdown("#### Rechercher une adresse")
+            st.markdown("#### ߔ Rechercher une adresse")
             search_query = st.text_input("", placeholder="Ex : 12 rue de la Paix 88000 Épinal…",
                                          key="addr_search_query",
                                          label_visibility="collapsed")
-            if st.button("⌕ Chercher", key="addr_search_btn",
+            if st.button("ߔ Chercher", key="addr_search_btn",
                          use_container_width=True, type="primary"):
                 if search_query:
                     with st.spinner("Recherche…"):
@@ -4138,20 +4110,20 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
 
         # ── Onglet Import / Export ───────────────────────────────────────
         with tab_csv:
-            st.markdown("#### ↓ Export du carnet")
+            st.markdown("#### ߓ Export du carnet")
             contacts_csv = StateManager.get_contacts()
             if contacts_csv:
                 csv_exp = AddressBookManager.export_to_csv()
-                st.download_button("↓ Télécharger le carnet (CSV)",
+                st.download_button("ߓ Télécharger le carnet (CSV)",
                                    data=csv_exp, file_name="carnet_adresses.csv",
                                    mime="text/csv", use_container_width=True)
             else:
                 st.info("Aucun contact à exporter.")
 
             st.markdown("---")
-            st.markdown("#### ↑ Import / Mise à jour")
+            st.markdown("#### ߓ Import / Mise à jour")
             template_dl = AddressBookManager.get_csv_template()
-            st.download_button("⎘ Télécharger le modèle CSV", data=template_dl,
+            st.download_button("ߓ Télécharger le modèle CSV", data=template_dl,
                                file_name="modele_carnet.csv", mime="text/csv")
             uploaded_csv = st.file_uploader("Choisir un fichier CSV", type=["csv"],
                                             key="upload_csv_tab")
@@ -4170,7 +4142,7 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                             for err in errors[:5]: st.caption(f"⚠️ {err}")
                         st.rerun()
                 with c2:
-                    if st.button("↺ Remplacer tout le carnet", key="btn_csv_replace",
+                    if st.button("ߔ Remplacer tout le carnet", key="btn_csv_replace",
                                  use_container_width=True,
                                  help="Supprime l'existant et importe ce fichier"):
                         if st.session_state.get("_confirm_replace_csv"):
