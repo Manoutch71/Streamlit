@@ -167,6 +167,8 @@ class RouteResult:
     matin_duration: int = 0
     matin_count: int = 0
     initial_distance: float = 0.0   # distance ordre séquentiel — pour calcul du gain
+    tour_hash: int = 0               # hash de la tournée au moment du calcul
+    stuck_matin_libre: List[str] = field(default_factory=list)  # points "Matin libre" non planifiables le matin
 
 # ==========================================================
 # STATE MANAGER
@@ -190,8 +192,8 @@ class StateManager:
             # Paramètres configurables de l'optimiseur
             "opt_pause_start":  12 * SPH,   # 12h00
             "opt_pause_end":    13 * SPH,   # 13h00
-            "opt_max_matin_dur":  4 * SPH,  # Objectif matin 4h
-            "opt_max_matin_slots": 4,       # max arrêts matin
+            "opt_max_matin_dur":  int(3.5 * SPH),  # Objectif matin 3h30
+            "opt_max_matin_slots": 3,               # max arrêts matin
         }
         for k, v in defaults.items():
             if k not in st.session_state:
@@ -244,12 +246,26 @@ class StateManager:
     def remove_point(i):
         if 0 <= i < len(st.session_state.delivery_points):
             st.session_state.delivery_points.pop(i)
+        st.session_state["_clear_addr_widgets"] = True
 
     @staticmethod
     def update_point(i, **kw):
         p = st.session_state.delivery_points[i]
         for k, v in kw.items():
             if hasattr(p, k): setattr(p, k, v)
+        # Marquer les clés widget comme à effacer au prochain run
+        # (on ne peut pas les modifier directement : widgets déjà instanciés)
+        st.session_state["_clear_addr_widgets"] = True
+
+    @staticmethod
+    def _clear_address_widget_keys():
+        """Efface toutes les clés widget des adresses.
+        Doit être appelé AVANT l'instanciation des widgets (début de address_list)."""
+        n = len(st.session_state.delivery_points)
+        for i in range(n + 5):
+            for prefix in ("mode_", "svc_", "notes_", "itype_", "tgt_h_", "tgt_m_",
+                           "prev_type_"):
+                st.session_state.pop(f"{prefix}{i}", None)
 
     @staticmethod
     def points() -> List[DeliveryPoint]:
@@ -461,6 +477,51 @@ class StateManager:
             # Sauvegarde automatique
             AddressBookManager.save_to_file()
     
+    @staticmethod
+    def move_result_node(step: int, direction: int):
+        """Déplace un node dans result.order (direction: -1=monter, +1=descendre).
+        Recalcule les horaires depuis la matrice en cache — pas d'appel OSRM."""
+        result = st.session_state.get("optimized_result")
+        mats   = st.session_state.get("_last_mats")
+        if not result or not mats:
+            return
+        order = list(result.order)
+        # step dans order[] — on ne déplace pas le dépôt (index 0) ni le retour (index -1)
+        target = step + direction
+        if target <= 0 or target >= len(order) - 1:
+            return
+        order[step], order[target] = order[target], order[step]
+        cfg = StateManager.config()
+        pts = StateManager.points()
+        _, dur_s = mats
+        svc = [cfg.start_service_duration] + [p.service_duration for p in pts] + [0]
+        new_arrivals = Optimizer._compute_times(order, cfg.start_time, dur_s, svc, pts)
+
+        # Vérifier que le nouvel ordre ne fait pas déborder un arrêt sur la pause (> 5 min)
+        p_     = Optimizer._params()
+        pause_s = p_["pause_start"]
+        TOLERANCE = 5 * 60
+        n_pts = len(pts)
+        for s, nd in enumerate(order):
+            if 0 < nd <= n_pts:
+                arr = new_arrivals[s]
+                fin = arr + pts[nd - 1].service_duration
+                if arr < pause_s and fin > pause_s + TOLERANCE:
+                    # Refuser le déplacement — remettre l'ordre d'origine
+                    st.toast("⛔ Déplacement refusé : débordement sur la pause déjeuner.", icon="ߚ")
+                    return
+        dist_m, _ = mats
+        new_dist = sum(float(dist_m[order[k]][order[k+1]]) for k in range(len(order)-1))
+        import dataclasses
+        st.session_state.optimized_result = dataclasses.replace(
+            result,
+            order=order,
+            arrival_times=new_arrivals,
+            total_distance=new_dist,
+            total_time=new_arrivals[-1] - cfg.start_time,
+            is_approximation=True,   # ordre manuel = plus optimal
+        )
+
     @staticmethod
     def move_point_up(i: int):
         """Monte un arrêt d'une position"""
@@ -1018,7 +1079,8 @@ class TW:
         def f(s): return f"{s//3600:02d}:{(s%3600)//60:02d}"
         if lo == hi:
             return f"{f(lo)} (précis)"
-        return f"{f(lo)} – {f(hi)}"
+        a, b = min(lo, hi), max(lo, hi)   # garantit l'ordre croissant quelle que soit la source
+        return f"{f(a)} – {f(b)}"
 
     @staticmethod
     def priority(p: DeliveryPoint) -> int:
@@ -1841,7 +1903,7 @@ class Optimizer:
         chain_fixe  = Optimizer._nearest_chain(last_matin, fixe_nodes,  dur_s)
         last_fixe   = chain_fixe[-1] if chain_fixe else last_matin
         chain_apm   = Optimizer._nearest_chain(last_fixe,  apm_nodes,   dur_s)
-        matin_nodes, apm_nodes, chain_matin, _ = Optimizer._enforce_matin_budget(
+        matin_nodes, apm_nodes, chain_matin, _, _stuck1 = Optimizer._enforce_matin_budget(
             chain_matin, apm_nodes, matin_nodes, points, dur_s, svc, config
         )
         last_matin = chain_matin[-1] if chain_matin else 0
@@ -1906,10 +1968,23 @@ class Optimizer:
         chain_apm   = Optimizer._randomized_best_chain(
             chain_apm, last_fixe2, n_pts + 1, dur_s, n_trials=n_trials)
 
+        # B-fix : re-vérifier le budget matin après réordonnement —
+        # _randomized_best_chain peut avoir allongé le temps matin.
+        matin_nodes, apm_nodes, chain_matin, _, _stuck2 = Optimizer._enforce_matin_budget(
+            chain_matin, apm_nodes, matin_nodes, points, dur_s, svc, config
+        )
+        _all_stuck = list(dict.fromkeys(_stuck1 + _stuck2))  # dédupliqué, ordre préservé
+        if apm_nodes:
+            last_fixe2b = chain_fixe[-1] if chain_fixe else (chain_matin[-1] if chain_matin else 0)
+            chain_apm   = Optimizer._randomized_best_chain(
+                list(set(chain_apm) | set(apm_nodes) - set(chain_apm)),
+                last_fixe2b, n_pts + 1, dur_s, n_trials=n_trials)
+
         full_chain = chain_matin + chain_fixe + chain_apm
         order = [0] + full_chain + [n_pts + 1]
         arrivals = Optimizer._compute_times(order, config.start_time, dur_s, svc, points)
-        Optimizer._check_constraints(order, arrivals, points, n_pts)
+        # _check_constraints retiré ici : il s'affiche dans UI.results() (option C)
+        # et non au milieu du spinner de planification.
         total_dist = sum(float(dist_m[order[k]][order[k+1]]) for k in range(len(order)-1))
         matin_dur = (svc[0]
                      + sum(int(dur_s[chain_matin[k-1] if k>0 else 0][chain_matin[k]])
@@ -1936,7 +2011,9 @@ class Optimizer:
             matin_count=len(chain_matin),
             initial_distance=sum(
                 float(dist_m[k][k+1]) for k in range(len(order)-1)
-            ),  # ordre séquentiel 0→1→2→…→n+1
+            ),
+            tour_hash=tour_hash,
+            stuck_matin_libre=_all_stuck,
         )
         # Mettre en cache : même tournée → même résultat sans recalcul
         st.session_state["_optim_cache"] = (tour_hash, result)
@@ -2011,7 +2088,9 @@ class Optimizer:
     ):
         SEUIL   = Optimizer.PROXIMITY_SEUIL
         p_      = Optimizer._params()
-        MAX_DUR = p_["max_dur"]
+        # A-fix : même logique que _enforce_matin_budget — déduire svc[0]
+        PAUSE_START = p_["pause_start"]
+        MAX_DUR = min(p_["max_dur"], max(0, PAUSE_START - config.start_time - svc[0]))
         MAX_SLT = p_["max_slots"]
         def mode_of(node):
             return points[node - 1].time_mode
@@ -2099,11 +2178,18 @@ class Optimizer:
         chain_matin, apm_nodes, matin_nodes, points, dur_s, svc, config
     ):
         p      = Optimizer._params()
-        MAX_DUR   = p["max_dur"]
+        # A-fix : déduire svc[0] (service au départ) du budget disponible.
+        # matin_total_time inclut svc[0], donc le vrai budget clients =
+        # pause_start - start_time - svc[0].
+        PAUSE_START = p["pause_start"]
+        MAX_DUR   = min(p["max_dur"], max(0, PAUSE_START - config.start_time - svc[0]))
         MAX_SLOTS = p["max_slots"]
-        def is_movable(mat_idx: int) -> bool:
-            p = points[mat_idx - 1]
-            return p.time_mode in ("Libre", "Matin libre")
+
+        def is_libre(mat_idx: int) -> bool:
+            """Seuls les points 'Libre' peuvent être déplacés en APM.
+            'Matin libre' est une contrainte explicite — on ne le déplace jamais ici."""
+            return points[mat_idx - 1].time_mode == "Libre"
+
         def matin_total_time(chain: List[int]) -> int:
             t   = svc[0]
             cur = 0
@@ -2111,20 +2197,21 @@ class Optimizer:
                 t  += int(dur_s[cur][node]) + svc[node]
                 cur = node
             return t
+
         chain = list(chain_matin)
         apm   = list(apm_nodes)
         matin = list(matin_nodes)
-        # D: calcul initial unique, puis mise à jour incrémentale à chaque retrait
         dur_m = matin_total_time(chain)
+
         for _ in range(len(chain) + 1):
             nb = len(chain)
             if dur_m <= MAX_DUR and nb <= MAX_SLOTS:
                 break
             moved = False
+            # Option B : ne déplacer que les "Libre" — jamais les "Matin libre"
             for j in range(len(chain) - 1, -1, -1):
                 node = chain[j]
-                if is_movable(node):
-                    # D: mise à jour incrémentale — soustrait uniquement le coût du nœud retiré
+                if is_libre(node):
                     prev_node = chain[j - 1] if j > 0 else 0
                     next_node = chain[j + 1] if j < len(chain) - 1 else None
                     cost_removed = int(dur_s[prev_node][node]) + svc[node]
@@ -2139,7 +2226,16 @@ class Optimizer:
                     break
             if not moved:
                 break
-        return matin, apm, chain, apm
+
+        # Fallback A : détecter les "Matin libre" qui restent dans la chaîne
+        # alors que le budget est dépassé — impossible à résoudre automatiquement.
+        stuck_matin_libre = []
+        if dur_m > MAX_DUR or len(chain) > MAX_SLOTS:
+            for node in chain:
+                if points[node - 1].time_mode == "Matin libre":
+                    stuck_matin_libre.append(points[node - 1].address)
+
+        return matin, apm, chain, apm, stuck_matin_libre
 
     @staticmethod
     def _compute_times(order, start_time, dur_s, svc, points):
@@ -2147,6 +2243,7 @@ class Optimizer:
         p_     = Optimizer._params()
         PAUSE_START = p_["pause_start"]
         PAUSE_END   = p_["pause_end"]
+        TOLERANCE   = 5 * 60  # 5 min de débord autorisé
         arrivals = []
         t = start_time
         for step, node in enumerate(order):
@@ -2157,8 +2254,14 @@ class Optimizer:
                     if PAUSE_START <= p.target_time < PAUSE_END:
                         is_precise_in_pause = True
             if not is_precise_in_pause:
+                # 1. Arrivée en pleine pause → repousser à PAUSE_END
                 if PAUSE_START <= t < PAUSE_END:
                     t = PAUSE_END
+                # 2. Arrivée avant pause mais fin de service déborde > TOLERANCE → repousser
+                elif t < PAUSE_START:
+                    service_here = svc[node] if node < len(svc) else 0
+                    if t + service_here > PAUSE_START + TOLERANCE:
+                        t = PAUSE_END
             if 0 < node <= n_pts:
                 p = points[node - 1]
                 tw_lo, tw_hi = TW.get(p)
@@ -2500,18 +2603,18 @@ class UI:
             st.markdown("#### ⚙️ Paramètres optimiseur")
             if st.session_state.pop("_reset_params_pending", False):
                 for k, v in [("inp_ps_h",12),("inp_ps_m",0),("inp_pe_h",13),
-                             ("inp_pe_m",0),("inp_max_dur",4),("inp_max_slots",4)]:
+                             ("inp_pe_m",0),("inp_max_dur",3.5),("inp_max_slots",3)]:
                     st.session_state[k] = v
                 st.session_state.opt_pause_start     = 12 * SPH
                 st.session_state.opt_pause_end       = 13 * SPH
-                st.session_state.opt_max_matin_dur   = 4  * SPH
-                st.session_state.opt_max_matin_slots = 4
+                st.session_state.opt_max_matin_dur   = int(3.5 * SPH)
+                st.session_state.opt_max_matin_slots = 3
 
             if "inp_ps_h"      not in st.session_state: st.session_state["inp_ps_h"]      = st.session_state.opt_pause_start // SPH
             if "inp_ps_m"      not in st.session_state: st.session_state["inp_ps_m"]      = (st.session_state.opt_pause_start % SPH) // SPM
             if "inp_pe_h"      not in st.session_state: st.session_state["inp_pe_h"]      = st.session_state.opt_pause_end // SPH
             if "inp_pe_m"      not in st.session_state: st.session_state["inp_pe_m"]      = (st.session_state.opt_pause_end % SPH) // SPM
-            if "inp_max_dur"   not in st.session_state: st.session_state["inp_max_dur"]   = st.session_state.opt_max_matin_dur // SPH
+            if "inp_max_dur"   not in st.session_state: st.session_state["inp_max_dur"]   = st.session_state.opt_max_matin_dur / SPH
             if "inp_max_slots" not in st.session_state: st.session_state["inp_max_slots"] = st.session_state.opt_max_matin_slots
 
             st.caption("Pause méridienne")
@@ -2532,9 +2635,9 @@ class UI:
                 else:
                     st.warning("La fin de pause doit être après le début.")
 
-            new_max_dur = st.slider("Objectif matin (h)", 1, 6, key="inp_max_dur")
-            if new_max_dur * SPH != st.session_state.opt_max_matin_dur:
-                st.session_state.opt_max_matin_dur = new_max_dur * SPH
+            new_max_dur = st.slider("Objectif matin (h)", 1.0, 4.0, step=0.5, key="inp_max_dur")
+            if int(new_max_dur * SPH) != st.session_state.opt_max_matin_dur:
+                st.session_state.opt_max_matin_dur = int(new_max_dur * SPH)
                 StateManager.commit()
             new_max_slots = st.slider("Max arrêts matin", 1, 10, key="inp_max_slots")
             if new_max_slots != st.session_state.opt_max_matin_slots:
@@ -2568,6 +2671,11 @@ class UI:
         
     @staticmethod
     def address_list():
+        # Effacer les clés widget si demandé par update_point/remove_point
+        # Doit être fait ICI, avant toute instanciation de widget
+        if st.session_state.pop("_clear_addr_widgets", False):
+            StateManager._clear_address_widget_keys()
+
         st.subheader("Configuration des interventions")
         cfg = StateManager.config()
         points = StateManager.points()
@@ -2617,12 +2725,6 @@ class UI:
                     else:
                         st.caption("—")
                 with c_btns:
-                    if st.button("↑", key=f"up_{i}", disabled=(i == 0), help="Monter"):
-                        StateManager.move_point_up(i)
-                        StateManager.commit()
-                    if st.button("↓", key=f"dn_{i}", disabled=(i == len(points)-1), help="Descendre"):
-                        StateManager.move_point_down(i)
-                        StateManager.commit()
                     if st.button("✎", key=f"edit_addr_{i}", help="Modifier l'adresse"):
                         UI._edit_point(i, p.address)
                     if st.button("✕", key=f"del_addr_{i}", help="Supprimer"):
@@ -2853,14 +2955,18 @@ class UI:
                         StateManager.update_point(i, time_mode=mode, target_time=tgt,
                             intervention_type=itype, notes=notes_val,
                             service_duration=svc_min*SPM)
+                        StateManager.commit()  # déclenche _reopt_pending si coordonnées connues
 
             st.markdown("---")
             st.write(f"**RETOUR:** {cfg.end_address or '(non configuré)'}")
 
     @staticmethod
     def _build_folium_map(cfg, points, show_route, folium):
-        """Construit l'objet folium.Map — séparé pour permettre le cache session."""
+        """Construit l'objet folium.Map — séparé pour permettre le cache session.
+        NB : map_click_queue est intentionnellement exclu du cache (et du build)
+        pour éviter que chaque clic ne reconstruise la carte et réinitialise le zoom."""
         m = folium.Map(location=MAP_CENTER, zoom_start=14)
+        m.options['doubleClickZoom'] = False  # empêche le zoom natif Leaflet sur double-clic
 
         if cfg.start_coordinates:
             folium.Marker(cfg.start_coordinates,
@@ -2892,12 +2998,6 @@ class UI:
                 folium.PolyLine(route_coords,
                                 color="orange" if result.is_approximation else "green",
                                 weight=4, opacity=0.8).add_to(m)
-
-        if st.session_state.get("map_click_queue"):
-            for qi, (qlat, qlon) in enumerate(st.session_state["map_click_queue"]):
-                folium.Marker(location=[qlat, qlon],
-                              popup=f"ߓ Point {qi+1}",
-                              icon=folium.Icon(color="cadetblue", icon="plus-sign")).add_to(m)
         return m
 
     @staticmethod
@@ -2908,13 +3008,15 @@ class UI:
         folium, st_folium = _import_folium()
 
         # ── Clé de cache : change si les données changent → rebuild automatique ──
+        # map_click_queue est EXCLU volontairement : si on l'incluait, chaque clic
+        # reconstruit la carte (nouveau folium.Map) et Leaflet réinitialise le zoom.
+        # Les points en attente sont listés sous la carte — pas besoin de marqueurs.
         cache_key = (
             cfg.start_coordinates,
             cfg.end_coordinates,
             tuple((p.coordinates, p.time_mode, p.address) for p in points),
             show_route,
             st.session_state.optimized_result is not None,
-            tuple(st.session_state.get("map_click_queue", [])),
         )
         cached = st.session_state.get("_map_cache")
         if cached and cached[0] == cache_key:
@@ -2983,8 +3085,9 @@ class UI:
                     if st.button("✖", key=f"map_q_rm_{qi}", help="Retirer ce point"):
                         queue.pop(qi)
                         st.session_state["map_click_queue"] = queue
-                        st.session_state.pop("_map_last_processed_click", None)
-                        # Nettoyer les clés de cache d'adresses
+                        # NE PAS effacer _map_last_processed_click ici :
+                        # st_folium renvoie toujours last_clicked au rerun suivant,
+                        # et sans cette mémoire le point serait immédiatement re-ajouté.
                         for k in [f"map_q_addr_{j}" for j in range(qi, len(queue)+1)]:
                             st.session_state.pop(k, None)
                         st.rerun()
@@ -3003,7 +3106,7 @@ class UI:
                             pts_q[-1].coordinates = (qlat, qlon)
                     # Vider la file
                     st.session_state["map_click_queue"] = []
-                    st.session_state.pop("_map_last_processed_click", None)
+                    # NE PAS effacer _map_last_processed_click : même raison.
                     for k in list(st.session_state.keys()):
                         if k.startswith("map_q_addr_") or k.startswith("map_q_edit_"):
                             del st.session_state[k]
@@ -3012,7 +3115,7 @@ class UI:
                 if st.button("✖ Vider la sélection", key="map_q_clear",
                              use_container_width=True):
                     st.session_state["map_click_queue"] = []
-                    st.session_state.pop("_map_last_processed_click", None)
+                    # NE PAS effacer _map_last_processed_click : même raison.
                     for k in list(st.session_state.keys()):
                         if k.startswith("map_q_addr_") or k.startswith("map_q_edit_"):
                             del st.session_state[k]
@@ -3027,6 +3130,25 @@ class UI:
         result: RouteResult = st.session_state.optimized_result
         cfg = StateManager.config()
         points = StateManager.points()
+
+        # ── Détection résultat obsolète ───────────────────────────────────────
+        # Recalculer le hash actuel (mêmes champs que dans Optimizer.optimize)
+        _p_hash  = Optimizer._params()
+        _current_hash = hash((
+            cfg.start_address, cfg.end_address,
+            cfg.start_time, cfg.start_service_duration,
+            tuple((p.address, p.time_mode, p.target_time,
+                   p.intervention_type, p.service_duration) for p in points),
+            _p_hash["pause_start"], _p_hash["pause_end"],
+            _p_hash["max_dur"],     _p_hash["max_slots"],
+        ))
+        _result_stale = (result.tour_hash != _current_hash)
+        if _result_stale:
+            st.warning(
+                "⚠️ La tournée affichée ne correspond plus aux paramètres actuels. "
+                "Cliquez sur **ߗ️ Planifier** pour recalculer."
+            )
+            return
 
         st.markdown("<div id='ordre-de-passage'></div>", unsafe_allow_html=True)
         col_title, col_top = st.columns([8, 1])
@@ -3046,6 +3168,47 @@ class UI:
         badge = "⭐" if not result.is_approximation else "ߓ"
         moved_txt = f" · ⚠️ {len(result.matin_moved)} déplacé(s) PM" if result.matin_moved else ""
         st.caption(f"{badge} Matin : {result.matin_count} arrêt(s) — {h_m}h{min_m:02d}{moved_txt}")
+
+        # ── Fallback A : points "Matin libre" non placés le matin ────────────
+        _stuck = result.stuck_matin_libre
+        if _stuck:
+            st.error(
+                "⚠️ **Impossible de respecter la contrainte 'Matin libre'** pour :\n\n"
+                + "\n\n".join(f"• {a[:60]}" for a in _stuck)
+                + "\n\nߒ Le budget matin est insuffisant. "
+                "Augmentez **Objectif matin** dans les paramètres, "
+                "réduisez la durée des interventions du matin, "
+                "ou passez certains points en **Libre**."
+            )
+
+        n_pts = len(points)
+
+        # ── C : Détection dépassements sur la pause — avertissement simple ───
+        _p_c       = Optimizer._params()
+        _pause_s   = _p_c["pause_start"]
+        _TOLERANCE = 5 * 60
+        _fmt_t2    = lambda s: f"{s//3600:02d}:{(s%3600)//60:02d}"
+        _overflow_nodes = set()   # nodes à surligner en rouge dans le tableau
+        _warn_lines = []
+        for _step, _node in enumerate(result.order):
+            if 0 < _node <= n_pts:
+                _pt  = points[_node - 1]
+                _arr = result.arrival_times[_step]
+                _fin = _arr + _pt.service_duration
+                if (_arr < _pause_s and _fin > _pause_s + _TOLERANCE) or \
+                   (_arr >= _pause_s and _pt.time_mode in ("Matin libre",)):
+                    _overflow_nodes.add(_node)
+                    _warn_lines.append(
+                        f"• **{_pt.address[:55]}** — "
+                        f"arrivée {_fmt_t2(_arr)}, fin {_fmt_t2(_fin)}"
+                    )
+        if _warn_lines:
+            st.warning(
+                "⏰ **Horaires incompatibles avec la pause déjeuner** — "
+                "ces adresses débordent ou ne peuvent pas être placées le matin. "
+                "Utilisez ߗ️ pour les retirer et les replanifier un autre jour :\n\n"
+                + "\n\n".join(_warn_lines)
+            )
         st.markdown("---")
 
         all_addr = [cfg.start_address] + [p.address for p in points] + [cfg.end_address]
@@ -3053,6 +3216,8 @@ class UI:
 
         def fmt_t(s):
             return f"{s//3600:02d}:{(s%3600)//60:02d}"
+
+        n_valid_steps = sum(1 for node in result.order if 0 < node <= n_pts)
 
         for step, node in enumerate(result.order):
             if node < 0 or node >= len(all_addr):
@@ -3069,7 +3234,21 @@ class UI:
                     service_start = lo
                     waiting = lo - arr_t
 
-            c1, c2, c3, c4, c5 = st.columns([1, 5, 2, 2, 2])
+            # Heure de fin = service_start + durée service
+            fin_t = None
+            if 0 < node <= n_pts:
+                fin_t = service_start + points[node - 1].service_duration
+            elif node == 0 and cfg.start_service_duration > 0:
+                fin_t = arr_t + cfg.start_service_duration
+
+            # Position dans la liste des arrêts clients (pour les flèches)
+            is_client = 0 < node <= n_pts
+            client_steps = [s for s, nd in enumerate(result.order) if 0 < nd <= n_pts]
+            pos_in_clients = client_steps.index(step) if is_client else -1
+            is_first_client = is_client and pos_in_clients == 0
+            is_last_client  = is_client and pos_in_clients == len(client_steps) - 1
+
+            c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1, 5, 2, 2, 2, 1, 1, 1])
             with c1:
                 st.write("ߏ" if node == 0 or node == n_pts + 1 else f"**{step}**")
             with c2:
@@ -3078,34 +3257,41 @@ class UI:
                 elif node == n_pts + 1:
                     st.write(f"**RETOUR :** {all_addr[-1]}")
                 else:
-                    st.write(all_addr[node])
-                    if 0 < node <= n_pts:
+                    if node in _overflow_nodes:
+                        st.markdown(
+                            f"<span style='color:#ff4b4b;font-weight:bold'>"
+                            f"⚠️ {all_addr[node]}</span>",
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.write(all_addr[node])
+                    if is_client:
                         p = points[node - 1]
                         if p.notes:
                             st.caption(f"ߓ {p.notes}")
             with c3:
                 if waiting > 0:
-                    st.write(f"ߚ {fmt_t(arr_t)}")
+                    st.write(f"ߕ {fmt_t(arr_t)}")
                     st.caption(f"⏳ attente {waiting//60}min")
-                    st.write(f"ߔ **{fmt_t(service_start)}**")
+                    st.write(f"▶️ **{fmt_t(service_start)}**")
                 else:
                     st.write(f"ߕ **{fmt_t(arr_t)}**")
+                if fin_t is not None:
+                    st.caption(f"ߏ {fmt_t(fin_t)}")
             with c4:
                 if node == 0:
                     d = cfg.start_service_duration
                     if d > 0:
                         st.caption(f"⏱ {d//SPM}min")
-                        depart_effectif = arr_t + d
-                        st.caption(f"→ départ {fmt_t(depart_effectif)}")
-                elif 0 < node <= n_pts:
+                elif is_client:
                     p = points[node - 1]
                     st.caption(f"⏱ {p.service_duration//SPM}min")
             with c5:
-                if 0 < node <= n_pts:
+                if is_client:
                     p = points[node - 1]
                     if p.time_mode != "Libre":
                         lo, hi = TW.get(p)
-                        st.caption(f"ߎ {TW.fmt(lo, hi)}")
+                        st.caption(f"ߓ {TW.fmt(lo, hi)}")
                         if lo == hi:
                             if service_start == lo:
                                 st.success("✓ exact")
@@ -3119,6 +3305,29 @@ class UI:
                                 st.error("⚠️ Hors fenêtre!")
                             else:
                                 st.success("✓")
+            with c6:
+                if is_client:
+                    if st.button("↑", key=f"res_up_{step}",
+                                 disabled=is_first_client,
+                                 help="Monter dans l'ordre"):
+                        StateManager.move_result_node(step, -1)
+                        st.rerun()
+            with c7:
+                if is_client:
+                    if st.button("↓", key=f"res_dn_{step}",
+                                 disabled=is_last_client,
+                                 help="Descendre dans l'ordre"):
+                        StateManager.move_result_node(step, +1)
+                        st.rerun()
+            with c8:
+                if is_client:
+                    if st.button("ߗ️", key=f"del_result_{node}",
+                                 help="Retirer de la tournée"):
+                        StateManager.remove_point(node - 1)
+                        st.session_state.pop("_optim_cache", None)
+                        st.session_state.optimized_result = None
+                        st.session_state["_reopt_pending"] = True
+                        st.rerun()
 
         st.markdown("---")
         st.markdown("<h4 style='margin:0.5rem 0 0.3rem 0;font-size:1rem'>Résumé</h4>", unsafe_allow_html=True)
@@ -3196,7 +3405,7 @@ def main():
         StateManager.init()
 
         # ── Ré-optimisation automatique après modification ─────────────────
-        if st.session_state.pop("_reopt_pending", False):
+        if st.session_state.pop("_reopt_pending", False) and not st.session_state.get("_manual_plan", False):
             cfg = StateManager.config()
             pts = StateManager.points()
             all_coords = (
@@ -3210,7 +3419,7 @@ def main():
                 result = Optimizer.optimize(cfg, pts, precomputed_mats=mats)
                 if result:
                     st.session_state.optimized_result = result
-                    # UI.sidebar() est appelé juste après dans ce même render
+                    st.session_state["_last_mats"] = mats
                 else:
                     st.session_state.optimized_result = None
 
@@ -3248,7 +3457,7 @@ div[data-testid="block-container"] {
     max-width: 1100px !important;
     padding-left: 1.5rem !important;
     padding-right: 1.5rem !important;
-    padding-top: 2rem !important;
+    padding-top: 1rem !important;
     margin-left: auto !important;
     margin-right: auto !important;
 }
@@ -3304,6 +3513,8 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                 run_optim = st.button("ߗ️", type="primary",
                                       use_container_width=False, key="btn_planifier",
                                       help="Planifier la tournée optimale ߘ")
+                if run_optim:
+                    st.session_state["_manual_plan"] = True
 
             with col_geo:
                 _do_geocode = st.button("ߓ", key="btn_geocode_main",
@@ -3381,6 +3592,9 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
 
             # ── Optimisation ──────────────────────────────────────────────────
             if run_optim:
+                st.session_state.pop("_optim_cache", None)
+                st.session_state.optimized_result = None
+
                 cfg = StateManager.config()
                 pts = StateManager.points()
 
@@ -3479,6 +3693,8 @@ div[data-testid="stMetricDelta"]   { font-size: 0.75rem !important; }
                                     _status.update(label="✅ Tournée planifiée !", state="complete",
                                                    expanded=False)
                                     st.session_state.optimized_result = result
+                                    st.session_state["_last_mats"] = mats_check
+                                    st.session_state["_manual_plan"] = False
                                     StateManager.save_to_history()
                                     st.rerun()
                                 else:
